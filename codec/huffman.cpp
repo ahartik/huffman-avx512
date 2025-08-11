@@ -187,7 +187,7 @@ std::string Compress(std::string_view raw) {
   return compressed;
 }
 
-std::string Decompress(std::string_view compressed) {
+std::string decompress(std::string_view compressed) {
   // Build codebook.
   const uint32_t raw_size = read_u32(compressed);
   const uint32_t len_mask = read_u32(compressed);
@@ -256,7 +256,7 @@ std::string Decompress(std::string_view compressed) {
 #endif
 
     // TODO: Optimize
-    uint32_t code = (buf_bits >> (buf_len - 32))& 0xfFFFfFFF;
+    uint32_t code = (buf_bits >> (buf_len - 32)) & 0xfFFFfFFF;
     int len = max_len;
     for (int j = 1; j < num_lens; ++j) {
       if (code_begin[lens[j]] > code) {
