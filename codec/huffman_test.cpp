@@ -1,5 +1,6 @@
 #include "codec/huffman.h"
 
+#include <cstdlib>
 #include <cstdio>
 
 #include <format>
@@ -21,6 +22,19 @@ TEST(HuffmanTest, Hello) {
   }
   printf("\n");
   std::cout << std::flush;
+  string decompressed = huffman::decompress(compressed);
+  EXPECT_EQ(raw, decompressed);
+}
+
+TEST(HuffmanTest, LongRandom) {
+  string raw;
+  int len = 1000;
+  for (int i = 0; i < len; ++i) {
+    // Make a biased distribution
+    uint8_t ch = (rand() & rand()) & 0xff;
+    raw.push_back(ch);
+  }
+  string compressed = huffman::compress(raw);
   string decompressed = huffman::decompress(compressed);
   EXPECT_EQ(raw, decompressed);
 }

@@ -19,8 +19,10 @@ struct BitCode {
   int len;
 };
 
+#ifdef HUFF_DEBUG
 void PrintCode(char sym, uint32_t bits, int len) {
-  std::cout << "Sym: '" << sym << "', code: ";
+  std::cout << "Sym: '" << sym << "' "
+    << std::format("(0x{:2x})", sym) << ", code: ";
   if (len < 0 || len > 32) {
     std::cout << "BAD LEN: " << len << "\n";
     return;
@@ -30,6 +32,7 @@ void PrintCode(char sym, uint32_t bits, int len) {
   }
   std::cout << "\n";
 }
+#endif
 
 struct Node {
   int count = 0;
@@ -128,13 +131,17 @@ std::string compress(std::string_view raw) {
     assert(len < 32);
     codes[sym].len = len;
     codes[sym].bits = current_code;
+#ifdef HUFF_DEBUG
     PrintCode(sym, current_code, len);
+#endif
     current_code += current_inc;
 
     ++len_count[len];
     len_mask |= 1 << len;
   }
+#ifdef HUFF_DEBUG
   std::cout << "compress: current_code at the end: " << current_code << "\n";
+#endif
 
   std::string compressed;
   // TODO: Fail for too long strings.
@@ -156,19 +163,25 @@ std::string compress(std::string_view raw) {
     cur |= uint64_t(code.bits) << (free_bits - 32);
     free_bits -= code.len;
 
+#ifdef HUFF_DEBUG
     PrintCode(s, code.bits, code.len);
     // std::cout << std::format("code.bits: {:032B}\n", code.bits);
     std::cout << std::format("Cur: {:064B}\n", cur);
+#endif
 
     if (free_bits <= 32) {
       write_u32(compressed, cur >> 32);
+#ifdef HUFF_DEBUG
       std::cout << std::format("Wrote: {:032B}\n", cur >> 32);
+#endif
       free_bits += 32;
       cur <<= 32;
     }
   }
   write_u32(compressed, cur >> 32);
+#ifdef HUFF_DEBUG
   std::cout << std::format("Leftover write: {:032B}\n", cur >> 32);
+#endif
   write_u32(compressed, 0);
 
   return compressed;
@@ -180,11 +193,16 @@ std::string decompress(std::string_view compressed) {
   const uint32_t len_mask = read_u32(compressed);
   uint8_t len_count[32] = {};
   int num_syms = 0;
+  int lens[32] = {};
+  int num_lens = 0;
   for (int i = 0; i < 32; ++i) {
     if (len_mask & (1 << i)) {
       len_count[i] = uint8_t(compressed[0]);
       compressed.remove_prefix(1);
       num_syms += len_count[i];
+
+      lens[num_lens] = i;
+      ++num_lens;
     }
   }
   std::vector<uint8_t> syms(
@@ -200,7 +218,6 @@ std::string decompress(std::string_view compressed) {
   uint8_t* len_syms[32] = {};
   uint32_t code_begin[32] = {};
   for (size_t i = 0; i < syms.size(); ++i) {
-    const uint8_t sym = syms[i];
     while (len_count[current_len] == current_len_count) {
       ++current_len;
       current_len_count = 0;
@@ -211,14 +228,19 @@ std::string decompress(std::string_view compressed) {
       code_begin[current_len] = current_code;
     }
     assert(current_len < 32);
+#ifdef HUFF_DEBUG
+    const uint8_t sym = syms[i];
     PrintCode(sym, current_code, current_len);
+#endif
 
     current_code += current_inc;
     ++current_len_count;
   }
+#ifdef HUFF_DEBUG
   for (int i = 0; i < 32; ++i) {
     std::cout << std::format("code_begin[{}] = {:032B}\n", i, code_begin[i]);
   }
+#endif
   const int max_len = current_len;
   uint64_t buf_bits  = 0;
   int buf_len = 0;
@@ -229,22 +251,29 @@ std::string decompress(std::string_view compressed) {
       buf_bits |= read_u32(compressed);
       buf_len += 32;
     }
+#ifdef HUFF_DEBUG
     std::cout << std::format("Buf {:064B} len = {}\n", buf_bits, buf_len);
+#endif
+
     // TODO: Optimize
     uint32_t code = (buf_bits >> (buf_len - 32))& 0xfFFFfFFF;
     int len = max_len;
-    for (int j = 1; j <= max_len; ++j) {
-      if (code_begin[j] > code) {
-        len = j-1;
+    for (int j = 1; j < num_lens; ++j) {
+      if (code_begin[lens[j]] > code) {
+        len = lens[j-1];
         break;
       }
     }
-    std::cout << "code len: " << len << "\n";
+#ifdef HUFF_DEBUG
+    std::cout << "code len: " << len << "\n" << std::flush;
+#endif
     int offset = (code - code_begin[len]) >> (32 - len);
     uint8_t sym = len_syms[len][offset];
     raw[i] = sym;
     buf_len -= len;
+#ifdef HUFF_DEBUG
     std::cout << std::format("Read {:032B} -> '{}'\n", code, char(sym));
+#endif
   }
   return raw; 
 }
