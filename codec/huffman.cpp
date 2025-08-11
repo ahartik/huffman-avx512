@@ -46,20 +46,19 @@ void PrintCode(char sym, uint32_t bits, int len) {
 struct Node {
   int count = 0;
 
-  // TODO: Modify this to not require so many dynamic allocations.
-  std::unique_ptr<Node> children[2];
+  int children[2] = {};
   uint8_t sym = 0;
   // Opposite order, since C++ heap is a max heap and we want
   // to pop smallest counts first.
   bool operator<(const Node& o) const { return count > o.count; }
 };
 
-void get_code_len(const Node* node, int len, int* code_len) {
-  if (node->children[0] == nullptr) {
+void get_code_len(const Node* tree, const Node* node, int len, int* code_len) {
+  if (node->children[0] == node->children[1]) {
     code_len[node->sym] = len;
   } else {
-    get_code_len(node->children[1].get(), len + 1, code_len);
-    get_code_len(node->children[0].get(), len + 1, code_len);
+    get_code_len(tree, &tree[node->children[0]], len + 1, code_len);
+    get_code_len(tree, &tree[node->children[1]], len + 1, code_len);
   }
 }
 
@@ -86,6 +85,7 @@ std::string Compress(std::string_view raw) {
     ++count[c];
   }
   std::vector<Node> heap;
+  std::vector<Node> tree;
   std::vector<uint8_t> syms;
   for (int c = 0; c < 256; ++c) {
     if (count[c] != 0) {
@@ -93,28 +93,32 @@ std::string Compress(std::string_view raw) {
       node.count = count[c];
       node.sym = uint8_t(c);
       syms.push_back(node.sym);
-      heap.push_back(std::move(node));
+      heap.push_back(node);
     }
   }
+  tree.reserve(heap.size());
   std::make_heap(heap.begin(), heap.end());
   while (heap.size() > 1) {
     // Pop two elements
-    Node a = std::move(heap[0]);
+    Node a = heap[0];
     std::pop_heap(heap.begin(), heap.end());
     heap.pop_back();
-    Node b = std::move(heap[0]);
+    Node b = heap[0];
     std::pop_heap(heap.begin(), heap.end());
     heap.pop_back();
 
+    tree.push_back(a);
+    tree.push_back(b);
+
     Node next;
     next.count = a.count + b.count;
-    next.children[0] = std::make_unique<Node>(std::move(a));
-    next.children[1] = std::make_unique<Node>(std::move(b));
-    heap.push_back(std::move(next));
+    next.children[0] = tree.size() - 2;
+    next.children[1] = tree.size() - 1;
+    heap.push_back(next);
     std::push_heap(heap.begin(), heap.end());
   }
   int code_len[256] = {};
-  get_code_len(&heap[0], 0, code_len);
+  get_code_len(&tree[0], &heap[0], 0, code_len);
 
   // Build "canonical Huffman code".
   std::sort(syms.begin(), syms.end(), [&code_len](uint8_t a, uint8_t b) {
@@ -297,12 +301,12 @@ std::string Decompress(std::string_view compressed) {
     std::cout << std::format("Buf {:064B} len = {}\n", buf_bits, buf_len);
 #endif
 
-    // TODO: Optimize
     const uint32_t code = (buf_bits >> (buf_len - 32)) & 0xfFFFfFFF;
 
     const int top_byte = code >> 24;
     int len = len_begin[top_byte];
 #if 0
+    // This is not any faster.
     if (len <= 8) {
       // Fast path, know the symbol based on the top 8 bits.
       raw[i] = fast_sym[top_byte];
