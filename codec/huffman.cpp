@@ -1,14 +1,15 @@
 #include "codec/huffman.h"
 
+#include <ctype.h>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
 
-#include <iostream>
-#include <format>
 #include <algorithm>
-#include <memory>
 #include <bit>
+#include <format>
+#include <iostream>
+#include <memory>
 #include <vector>
 
 namespace huffman {
@@ -20,9 +21,17 @@ struct BitCode {
 };
 
 #ifdef HUFF_DEBUG
+
+std::string SymToStr(uint8_t sym) {
+  if (std::isprint(sym)) {
+    return std::format("{:c}",sym);
+  } else {
+    return std::format("\\x{:02x}", sym);
+  }
+}
+
 void PrintCode(char sym, uint32_t bits, int len) {
-  std::cout << "Sym: '" << sym << "' "
-    << std::format("(0x{:2x})", sym) << ", code: ";
+  std::cout << "Sym: " << SymToStr(sym) << ", code: ";
   if (len < 0 || len > 32) {
     std::cout << "BAD LEN: " << len << "\n";
     return;
@@ -187,7 +196,7 @@ std::string Compress(std::string_view raw) {
   return compressed;
 }
 
-std::string decompress(std::string_view compressed) {
+std::string Decompress(std::string_view compressed) {
   // Build codebook.
   const uint32_t raw_size = read_u32(compressed);
   const uint32_t len_mask = read_u32(compressed);
@@ -207,8 +216,7 @@ std::string decompress(std::string_view compressed) {
   }
   std::vector<uint8_t> syms(
       reinterpret_cast<const uint8_t*>(&compressed[0]),
-      reinterpret_cast<const uint8_t*>(&compressed[num_syms])
-      );
+      reinterpret_cast<const uint8_t*>(&compressed[num_syms]));
   compressed.remove_prefix(num_syms);
 
   int current_len = 1;
@@ -217,11 +225,23 @@ std::string decompress(std::string_view compressed) {
   uint32_t current_inc = 1 << 31;
   uint8_t* len_syms[32] = {};
   uint32_t code_begin[32] = {};
+
+  // Build a map from first 8 bits of the code to code length.
+  uint8_t len_begin[256] = {};
+  // For short codes, we immediately know the output symbol.
+  uint8_t fast_sym[256] = {};
+
+#ifdef HUFF_DEBUG
+  uint8_t code_len[256] = {};
+#endif
   for (size_t i = 0; i < syms.size(); ++i) {
+    const uint8_t sym = syms[i];
     while (len_count[current_len] == current_len_count) {
       ++current_len;
       current_len_count = 0;
       current_inc >>= 1;
+      // Make sure there are no holes in this array.
+      code_begin[current_len] = current_code;
     }
     if (len_syms[current_len] == nullptr) {
       len_syms[current_len] = &syms[i];
@@ -229,20 +249,42 @@ std::string decompress(std::string_view compressed) {
     }
     assert(current_len < 32);
 #ifdef HUFF_DEBUG
-    const uint8_t sym = syms[i];
     PrintCode(sym, current_code, current_len);
+    code_len[sym] = current_len;
 #endif
 
+    if (current_len <= 8) {
+      uint32_t x_begin = current_code >> 24;
+      for (uint32_t x = x_begin; x < x_begin + (current_inc >> 24); ++x) {
+        len_begin[x] = current_len;
+        fast_sym[x] = sym;
+      }
+    } else {
+      uint32_t x = current_code >> 24;
+      if (len_begin[x] == 0) {
+        len_begin[x] = current_len;
+      }
+    }
     current_code += current_inc;
     ++current_len_count;
   }
+  // Should have exactly wrapped around:
+  assert(current_code == 0);
+  assert(len_begin[255] >= 0);
 #ifdef HUFF_DEBUG
   for (int i = 0; i < 32; ++i) {
-    std::cout << std::format("code_begin[{}] = {:032B}\n", i, code_begin[i]);
+    std::cout << std::format("code_begin[{:2d}] = {:032B}\n", i, code_begin[i]);
+  }
+  for (int i = 0; i < 256; ++i) {
+    if (len_begin[i] == 0) {
+      std::cout << "i=" << i << "\n" << std::flush;
+    }
+    assert(len_begin[i] != 0);
   }
 #endif
+
   const int max_len = current_len;
-  uint64_t buf_bits  = 0;
+  uint64_t buf_bits = 0;
   int buf_len = 0;
   std::string raw(raw_size, 0);
   for (size_t i = 0; i < raw_size; ++i) {
@@ -256,26 +298,38 @@ std::string decompress(std::string_view compressed) {
 #endif
 
     // TODO: Optimize
-    uint32_t code = (buf_bits >> (buf_len - 32)) & 0xfFFFfFFF;
-    int len = max_len;
-    for (int j = 1; j < num_lens; ++j) {
-      if (code_begin[lens[j]] > code) {
-        len = lens[j-1];
-        break;
+    const uint32_t code = (buf_bits >> (buf_len - 32)) & 0xfFFFfFFF;
+
+    const int top_byte = code >> 24;
+    int len = len_begin[top_byte];
+#if 0
+    if (len <= 8) {
+      // Fast path, know the symbol based on the top 8 bits.
+      raw[i] = fast_sym[top_byte];
+      buf_len -= len;
+    } else
+#endif
+    {
+      // We don't know the exact length of this code
+      while ((code_begin[len + 1] != 0) & (code_begin[len + 1] <= code)) {
+        ++len;
       }
+#ifdef HUFF_DEBUG
+      std::cout << "code len: " << len << "\n" << std::flush;
+#endif
+      int offset = (code - code_begin[len]) >> (32 - len);
+      uint8_t sym = len_syms[len][offset];
+      raw[i] = sym;
+      buf_len -= len;
+#ifdef HUFF_DEBUG
+      std::cout << std::format("Read {:032B} -> '{}'\n", code, SymToStr(sym));
+      std::cout << "code_len[sym] = " << int(code_len[sym]) << "\n"
+                << std::flush;
+      assert(len == code_len[sym]);
+#endif
     }
-#ifdef HUFF_DEBUG
-    std::cout << "code len: " << len << "\n" << std::flush;
-#endif
-    int offset = (code - code_begin[len]) >> (32 - len);
-    uint8_t sym = len_syms[len][offset];
-    raw[i] = sym;
-    buf_len -= len;
-#ifdef HUFF_DEBUG
-    std::cout << std::format("Read {:032B} -> '{}'\n", code, char(sym));
-#endif
   }
-  return raw; 
+  return raw;
 }
 
 }  // namespace huffman

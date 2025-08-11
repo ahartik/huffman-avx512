@@ -28,10 +28,13 @@ TEST(HuffmanTest, Hello) {
 
 TEST(HuffmanTest, LongRandom) {
   string raw;
-  int len = 1000;
+  int len = 2000;
   for (int i = 0; i < len; ++i) {
-    // Make a biased distribution
-    uint8_t ch = (rand() & rand()) & 0xff;
+    uint8_t ch = 0;
+    do {
+      // Make a biased distribution
+      ch = (rand() & rand() & rand()) & 0xff;
+    } while(!std::isprint(ch));
     raw.push_back(ch);
   }
   string compressed = huffman::Compress(raw);
