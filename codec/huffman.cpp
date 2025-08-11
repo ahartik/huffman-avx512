@@ -71,7 +71,7 @@ uint32_t read_u32(std::string_view& in) {
 
 }  // namespace
 
-std::string compress(std::string_view raw) {
+std::string Compress(std::string_view raw) {
   int count[256] = {};
   for (const unsigned char c : raw) {
     ++count[c];
@@ -187,7 +187,7 @@ std::string compress(std::string_view raw) {
   return compressed;
 }
 
-std::string decompress(std::string_view compressed) {
+std::string Decompress(std::string_view compressed) {
   // Build codebook.
   const uint32_t raw_size = read_u32(compressed);
   const uint32_t len_mask = read_u32(compressed);

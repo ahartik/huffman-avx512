@@ -13,3 +13,12 @@ cc_test(
   ],
 )
 
+cc_binary(
+  name = "huffman_benchmark",
+  srcs = ["huffman_benchmark.cpp"],
+  deps = [
+    ":huffman",
+    "@google_benchmark//:benchmark_main"
+  ],
+)
+

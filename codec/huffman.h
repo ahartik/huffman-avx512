@@ -10,7 +10,7 @@ namespace huffman {
 namespace internal {
 }
 
-std::string compress(std::string_view raw);
-std::string decompress(std::string_view compressed);
+std::string Compress(std::string_view raw);
+std::string Decompress(std::string_view compressed);
 
 }

@@ -12,7 +12,7 @@ using std::string;
 TEST(HuffmanTest, Hello) {
   string raw = "Hello World";
 
-  string compressed = huffman::compress(raw);
+  string compressed = huffman::Compress(raw);
   std::cout << std::flush;
   for (int i = 0; i < compressed.size(); ++i) {
     printf("%02x ", int(uint8_t(compressed[i])));
@@ -22,7 +22,7 @@ TEST(HuffmanTest, Hello) {
   }
   printf("\n");
   std::cout << std::flush;
-  string decompressed = huffman::decompress(compressed);
+  string decompressed = huffman::Decompress(compressed);
   EXPECT_EQ(raw, decompressed);
 }
 
@@ -34,7 +34,8 @@ TEST(HuffmanTest, LongRandom) {
     uint8_t ch = (rand() & rand()) & 0xff;
     raw.push_back(ch);
   }
-  string compressed = huffman::compress(raw);
-  string decompressed = huffman::decompress(compressed);
+  string compressed = huffman::Compress(raw);
+  string decompressed = huffman::Decompress(compressed);
   EXPECT_EQ(raw, decompressed);
 }
+
