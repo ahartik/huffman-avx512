@@ -289,7 +289,7 @@ class Decoder {
       while (len_count[current_len] == current_len_count) {
         ++current_len;
         current_len_count = 0;
-        current_inc = 1ull << (32 - current_len);
+        current_inc >>= 1;
         // Make sure there are no holes in this array.
         code_begin_[current_len] = current_code;
       }
@@ -486,6 +486,7 @@ std::string CompressMulti(std::string_view raw) {
   }
 
   for (int i = 0; i < sizes[K - 1]; ++i) {
+   #pragma GCC unroll 8
     for (int k = 0; k < K; ++k) {
       uint8_t sym = part_input[k][i];
       BitCode code = coding.codes[sym];
@@ -556,10 +557,13 @@ std::string DecompressMulti(std::string_view compressed) {
   }
 
   for (int i = 0; i < sizes[K - 1]; ++i) {
+   #pragma GCC unroll 8
     for (int k = 0; k < K; ++k) {
       const uint32_t code = reader[k].GetTopBits();
-      int bits_read =
-          decoder.Decode(code, reinterpret_cast<uint8_t*>(&part_output[k][i]));
+      uint8_t sym;
+      int bits_read = decoder.Decode(code, &sym);
+      *part_output[k] = sym;
+      ++part_output[k];
       reader[k].ConsumeBits(bits_read);
     }
   }
@@ -570,7 +574,7 @@ std::string DecompressMulti(std::string_view compressed) {
       uint8_t sym;
       int bits_read = decoder.Decode(code, &sym);
       reader[k].ConsumeBits(bits_read);
-      part_output[k][sizes[k] - 1] = sym;
+      *part_output[k] = sym;
 #ifdef HUFF_DEBUG
       std::cout << "Last sym " << k << " : " << SymToStr(sym) << "\n";
 #endif

@@ -12,5 +12,7 @@ build:asan --copt -g
 build:asan --copt -fno-omit-frame-pointer
 build:asan --linkopt -fsanitize=address
 
-build:profopt -c opt
-build:profopt --copt -g 
+build:profopt -c dbg
+build:profopt --copt -O2
+build:profopt --copt -g
+build:profopt --copt -DNDEBUG

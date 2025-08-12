@@ -143,5 +143,5 @@ void BM_DecompressLong(benchmark::State& state) {
   BENCHMARK(BM_DecompressLong<TYPE>);
 
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressor)
-DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<2>)
+// DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<2>)
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<4>)
