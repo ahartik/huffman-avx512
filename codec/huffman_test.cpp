@@ -9,12 +9,21 @@
 
 using std::string;
 
-TEST(HuffmanTest, Hello) {
+
+template<typename T>
+class CompressorTest : public ::testing::Test {
+  public:
+};
+
+using Compressors = ::testing::Types<huffman::HuffmanCompressor>;
+TYPED_TEST_SUITE(CompressorTest, Compressors);
+
+TYPED_TEST(CompressorTest, Hello) {
   string raw = "Hello World";
 
-  string compressed = huffman::Compress(raw);
+  string compressed = TypeParam::Compress(raw);
   std::cout << std::flush;
-  for (int i = 0; i < compressed.size(); ++i) {
+  for (size_t i = 0; i < compressed.size(); ++i) {
     printf("%02x ", int(uint8_t(compressed[i])));
     if (i % 8 == 7) {
       printf("\n");
@@ -22,11 +31,11 @@ TEST(HuffmanTest, Hello) {
   }
   printf("\n");
   std::cout << std::flush;
-  string decompressed = huffman::Decompress(compressed);
+  string decompressed = TypeParam::Decompress(compressed);
   EXPECT_EQ(raw, decompressed);
 }
 
-TEST(HuffmanTest, LongRandom) {
+TYPED_TEST(CompressorTest, LongRandom) {
   string raw;
   int len = 2000;
   for (int i = 0; i < len; ++i) {
@@ -37,26 +46,26 @@ TEST(HuffmanTest, LongRandom) {
     } while(!std::isprint(ch));
     raw.push_back(ch);
   }
-  string compressed = huffman::Compress(raw);
-  string decompressed = huffman::Decompress(compressed);
+  string compressed = TypeParam::Compress(raw);
+  string decompressed = TypeParam::Decompress(compressed);
   EXPECT_EQ(raw, decompressed);
 }
 
-TEST(HuffmanTest, SingleSymbolOnly) {
-  string compressed = huffman::Compress("AAA");
-  string decompressed = huffman::Decompress(compressed);
+TYPED_TEST(CompressorTest, SingleSymbolOnly) {
+  string compressed = TypeParam::Compress("AAA");
+  string decompressed = TypeParam::Decompress(compressed);
   EXPECT_EQ("AAA", decompressed);
 }
 
 #if 1
-TEST(HuffmanTest, EmptyString) {
-  string compressed = huffman::Compress("");
-  string decompressed = huffman::Decompress(compressed);
+TYPED_TEST(CompressorTest, EmptyString) {
+  string compressed = TypeParam::Compress("");
+  string decompressed = TypeParam::Decompress(compressed);
   EXPECT_EQ("", decompressed);
 }
 #endif
 
-TEST(HuffmanTest, ManyRandom) {
+TYPED_TEST(CompressorTest, ManyRandom) {
   int num_iters = 100;
   srand(0);
   for (int k = 0; k < num_iters; ++k) {
@@ -70,8 +79,9 @@ TEST(HuffmanTest, ManyRandom) {
       } while (!std::isprint(ch));
       raw.push_back(ch);
     }
-    string compressed = huffman::Compress(raw);
-    string decompressed = huffman::Decompress(compressed);
+    string compressed = TypeParam::Compress(raw);
+    string decompressed = TypeParam::Decompress(compressed);
     EXPECT_EQ(raw, decompressed) << "k = " << k;
   }
 }
+

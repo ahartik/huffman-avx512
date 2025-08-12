@@ -18,15 +18,23 @@ std::string DecompressMulti(std::string_view compressed);
 
 class HuffmanCompressor {
  public:
-  static std::string Compress(std::string_view raw);
-  static std::string Decompress(std::string_view compressed);
+  static std::string Compress(std::string_view raw) {
+    return ::huffman::Compress(raw);
+  }
+  static std::string Decompress(std::string_view compressed) {
+    return ::huffman::Decompress(compressed);
+  }
 };
 
-template<int> 
+template<int K> 
 class HuffmanCompressorMulti {
  public:
-  static std::string Compress(std::string_view raw);
-  static std::string Decompress(std::string_view compressed);
+  static std::string Compress(std::string_view raw) {
+    return CompressMulti<K>(raw);
+  }
+  static std::string Decompress(std::string_view compressed) {
+    return DecompressMulti<K>(compressed);
+  }
 };
 
 }  // namespace huffman
