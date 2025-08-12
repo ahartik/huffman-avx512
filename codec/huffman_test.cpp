@@ -15,8 +15,16 @@ class CompressorTest : public ::testing::Test {
   public:
 };
 
+class NameGenerator {
+ public:
+  template <typename T>
+  static std::string GetName(int) {
+    return T::name();
+  }
+};
+
 using Compressors = ::testing::Types<huffman::HuffmanCompressor>;
-TYPED_TEST_SUITE(CompressorTest, Compressors);
+TYPED_TEST_SUITE(CompressorTest, Compressors, NameGenerator);
 
 TYPED_TEST(CompressorTest, Hello) {
   string raw = "Hello World";
@@ -85,3 +93,16 @@ TYPED_TEST(CompressorTest, ManyRandom) {
   }
 }
 
+
+TEST(MultiTest, Compress2) {
+  string raw = "Hello World";
+  string compressed = huffman::CompressMulti<2>(raw);
+  std::cout << std::flush;
+  for (size_t i = 0; i < compressed.size(); ++i) {
+    printf("%02x ", int(uint8_t(compressed[i])));
+    if (i % 8 == 7) {
+      printf("\n");
+    }
+  }
+  printf("\n");
+}

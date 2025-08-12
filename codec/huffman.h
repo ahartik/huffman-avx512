@@ -2,6 +2,7 @@
 
 #include <array>
 #include <string>
+#include <format>
 #include <string_view>
 
 using ByteCounts = std::array<int, 256>;
@@ -24,6 +25,9 @@ class HuffmanCompressor {
   static std::string Decompress(std::string_view compressed) {
     return ::huffman::Decompress(compressed);
   }
+  static std::string name() {
+    return "Huffman";
+  }
 };
 
 template<int K> 
@@ -34,6 +38,9 @@ class HuffmanCompressorMulti {
   }
   static std::string Decompress(std::string_view compressed) {
     return DecompressMulti<K>(compressed);
+  }
+  static std::string name() {
+    return std::format("HuffmanMulti<{}>", K);
   }
 };
 
