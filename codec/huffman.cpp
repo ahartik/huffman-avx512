@@ -54,7 +54,7 @@ struct Node {
   bool operator<(const Node& o) const { return count > o.count; }
 };
 
-void get_code_len(const Node* tree, const Node* node, int len,
+void get_code_len(const std::vector<Node>& tree, const Node* node, int len,
                   uint8_t* code_len) {
   if (node->children[0] == node->children[1]) {
     code_len[node->sym] = len;
@@ -80,6 +80,7 @@ uint32_t read_u32(std::string_view& in) {
 }
 
 struct CanonicalCoding {
+  int sym_count[256] = {};
   uint8_t code_len[256] = {};
   BitCode codes[256] = {};
   uint8_t sorted_syms[256] = {};
@@ -90,22 +91,25 @@ struct CanonicalCoding {
 
 CanonicalCoding MakeCanonicalCoding(std::string_view text) {
   CanonicalCoding coding;
-  int count[256] = {};
+  if (text.empty()) {
+    return coding;
+  }
   for (const unsigned char c : text) {
-    ++count[c];
+    ++coding.sym_count[c];
   }
   std::vector<Node> heap;
   std::vector<Node> tree;
   std::vector<uint8_t> syms;
   for (int c = 0; c < 256; ++c) {
-    if (count[c] != 0) {
+    if (coding.sym_count[c] != 0) {
       Node node;
-      node.count = count[c];
+      node.count = coding.sym_count[c];
       node.sym = uint8_t(c);
       syms.push_back(node.sym);
       heap.push_back(node);
     }
   }
+
   tree.reserve(heap.size());
   std::make_heap(heap.begin(), heap.end());
   while (heap.size() > 1) {
@@ -127,7 +131,7 @@ CanonicalCoding MakeCanonicalCoding(std::string_view text) {
     heap.push_back(next);
     std::push_heap(heap.begin(), heap.end());
   }
-  get_code_len(&tree[0], &heap[0], 0, coding.code_len);
+  get_code_len(tree, &heap[0], 0, coding.code_len);
 
   // Build "canonical Huffman code".
 
@@ -147,7 +151,7 @@ CanonicalCoding MakeCanonicalCoding(std::string_view text) {
   }
   coding.num_syms = syms.size();
 
-  int current_len = 1;
+  int current_len = 0;
   uint32_t current_code = 0;
   uint32_t current_inc = 1 << 31;
   for (int j = 0; j < coding.num_syms; ++j) {
@@ -159,8 +163,8 @@ CanonicalCoding MakeCanonicalCoding(std::string_view text) {
       current_len = len;
       current_inc = 1 << (32 - len);
     }
-    assert(len > 0);
-    assert(len < 32);
+    assert(len >= 0);
+    assert(len <= 32);
     coding.codes[sym].len = len;
     coding.codes[sym].bits = current_code;
 #ifdef HUFF_DEBUG
@@ -209,7 +213,7 @@ class CodeWriter {
 
 class CodeReader {
  public:
-  CodeReader(char* input, size_t size) : input_(input), end_(input + size),
+  CodeReader(const char* input, size_t size) : input_(input), end_(input + size),
   buf_bits_(0), buf_len_(0){
     ConsumeBits(0);
   }
@@ -245,16 +249,26 @@ class CodeReader {
   }
 
  private:
-  char* input_;
-  char* end_;
+  const char* input_;
+  const char* end_;
   uint64_t buf_bits_;
   int buf_len_;
 };
+
+int CountBits(uint64_t x) {
+  return __builtin_popcountll(x);
+}
 
 }  // namespace
 
 std::string Compress(std::string_view raw) {
   CanonicalCoding coding = MakeCanonicalCoding(raw);
+
+  uint64_t output_bits = 0;
+  for (int i = 0; i < coding.num_syms; ++i) {
+    uint8_t sym = coding.sorted_syms[i];
+    output_bits += coding.codes[sym].len * coding.sym_count[sym];
+  }
 
   std::string compressed;
   // TODO: Fail for too long strings.
@@ -267,34 +281,15 @@ std::string Compress(std::string_view raw) {
   }
   compressed.append(reinterpret_cast<char*>(coding.sorted_syms),
                     coding.num_syms);
+  const int header_size = compressed.size();
+  compressed.resize(header_size + (output_bits+7) / 8);
 
-  uint64_t cur = 0;
-  uint64_t free_bits = 64;
+  CodeWriter writer(&compressed[header_size]);
   for (uint8_t s : raw) {
     BitCode code = coding.codes[s];
-    cur |= uint64_t(code.bits) << (free_bits - 32);
-    free_bits -= code.len;
-
-#ifdef HUFF_DEBUG
-    PrintCode(s, code.bits, code.len);
-    // std::cout << std::format("code.bits: {:032B}\n", code.bits);
-    std::cout << std::format("Cur: {:064B}\n", cur);
-#endif
-
-    if (free_bits <= 32) {
-      write_u32(compressed, cur >> 32);
-#ifdef HUFF_DEBUG
-      std::cout << std::format("Wrote: {:032B}\n", cur >> 32);
-#endif
-      free_bits += 32;
-      cur <<= 32;
-    }
+    writer.WriteCode(code);
   }
-  write_u32(compressed, cur >> 32);
-#ifdef HUFF_DEBUG
-  std::cout << std::format("Leftover write: {:032B}\n", cur >> 32);
-#endif
-  write_u32(compressed, 0);
+  writer.Finish();
 
   return compressed;
 }
@@ -305,44 +300,40 @@ std::string Decompress(std::string_view compressed) {
   const uint32_t len_mask = read_u32(compressed);
   uint8_t len_count[32] = {};
   int num_syms = 0;
-  int lens[32] = {};
-  int num_lens = 0;
   for (int i = 0; i < 32; ++i) {
     if (len_mask & (1 << i)) {
       len_count[i] = uint8_t(compressed[0]);
       compressed.remove_prefix(1);
       num_syms += len_count[i];
-
-      lens[num_lens] = i;
-      ++num_lens;
     }
   }
   std::vector<uint8_t> syms(
-      reinterpret_cast<const uint8_t*>(&compressed[0]),
-      reinterpret_cast<const uint8_t*>(&compressed[num_syms]));
+      compressed.begin(), compressed.begin() + num_syms);
   compressed.remove_prefix(num_syms);
 
-  int current_len = 1;
+  // Note that this code also handles the strange case where there is only 1
+  // symbol in the compressed text, in which case that symbol is encoded using
+  // 0 bits.
+  int current_len = 0;
   int current_len_count = 0;
   uint32_t current_code = 0;
-  uint32_t current_inc = 1 << 31;
+  uint32_t current_inc = 0;
   uint8_t* len_syms[32] = {};
   uint32_t code_begin[32] = {};
 
   // Build a map from first 8 bits of the code to code length.
   uint8_t len_begin[256] = {};
   // For short codes, we immediately know the output symbol.
-  uint8_t fast_sym[256] = {};
+  // uint8_t fast_sym[256] = {};
 
 #ifdef HUFF_DEBUG
   uint8_t code_len[256] = {};
 #endif
   for (size_t i = 0; i < syms.size(); ++i) {
-    const uint8_t sym = syms[i];
     while (len_count[current_len] == current_len_count) {
       ++current_len;
       current_len_count = 0;
-      current_inc >>= 1;
+      current_inc = 1 << (32 - current_len);
       // Make sure there are no holes in this array.
       code_begin[current_len] = current_code;
     }
@@ -352,6 +343,7 @@ std::string Decompress(std::string_view compressed) {
     }
     assert(current_len < 32);
 #ifdef HUFF_DEBUG
+    const uint8_t sym = syms[i];
     PrintCode(sym, current_code, current_len);
     code_len[sym] = current_len;
 #endif
@@ -360,7 +352,7 @@ std::string Decompress(std::string_view compressed) {
       uint32_t x_begin = current_code >> 24;
       for (uint32_t x = x_begin; x < x_begin + (current_inc >> 24); ++x) {
         len_begin[x] = current_len;
-        fast_sym[x] = sym;
+        // fast_sym[x] = sym;
       }
     } else {
       uint32_t x = current_code >> 24;
@@ -386,21 +378,10 @@ std::string Decompress(std::string_view compressed) {
   }
 #endif
 
-  uint64_t buf_bits = 0;
-  int buf_len = 0;
   std::string raw(raw_size, 0);
+  CodeReader reader(compressed.data(), compressed.size());
   for (size_t i = 0; i < raw_size; ++i) {
-    if (buf_len < 32) {
-      buf_bits <<= 32;
-      buf_bits |= read_u32(compressed);
-      buf_len += 32;
-    }
-#ifdef HUFF_DEBUG
-    std::cout << std::format("Buf {:064B} len = {}\n", buf_bits, buf_len);
-#endif
-
-    const uint32_t code = (buf_bits >> (buf_len - 32)) & 0xfFFFfFFF;
-
+    const uint32_t code = reader.GetTopBits();
     const int top_byte = code >> 24;
     int len = len_begin[top_byte];
 #if 0
@@ -422,7 +403,7 @@ std::string Decompress(std::string_view compressed) {
       int offset = (code - code_begin[len]) >> (32 - len);
       uint8_t sym = len_syms[len][offset];
       raw[i] = sym;
-      buf_len -= len;
+      reader.ConsumeBits(len);
 #ifdef HUFF_DEBUG
       std::cout << std::format("Read {:032B} -> '{}'\n", code, SymToStr(sym));
       std::cout << "code_len[sym] = " << int(code_len[sym]) << "\n"

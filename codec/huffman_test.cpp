@@ -42,3 +42,36 @@ TEST(HuffmanTest, LongRandom) {
   EXPECT_EQ(raw, decompressed);
 }
 
+TEST(HuffmanTest, SingleSymbolOnly) {
+  string compressed = huffman::Compress("AAA");
+  string decompressed = huffman::Decompress(compressed);
+  EXPECT_EQ("AAA", decompressed);
+}
+
+#if 1
+TEST(HuffmanTest, EmptyString) {
+  string compressed = huffman::Compress("");
+  string decompressed = huffman::Decompress(compressed);
+  EXPECT_EQ("", decompressed);
+}
+#endif
+
+TEST(HuffmanTest, ManyRandom) {
+  int num_iters = 100;
+  srand(0);
+  for (int k = 0; k < num_iters; ++k) {
+    string raw;
+    int len = 1 + rand() % 200;
+    for (int i = 0; i < len; ++i) {
+      uint8_t ch = 0;
+      do {
+        // Make a biased distribution
+        ch = (rand() & rand() & rand()) & 0xff;
+      } while (!std::isprint(ch));
+      raw.push_back(ch);
+    }
+    string compressed = huffman::Compress(raw);
+    string decompressed = huffman::Decompress(compressed);
+    EXPECT_EQ(raw, decompressed) << "k = " << k;
+  }
+}
