@@ -1,12 +1,14 @@
 #include "codec/huffman.h"
 
-#include <string>
-#include <cstdlib>
 #include <cstdint>
+#include <cstdlib>
+#include <string>
 
-#include "benchmark/benchmark.h""
+#include "benchmark/benchmark.h"
 
-static void BM_CompressBiased(benchmark::State& state) {
+namespace {
+template <typename Compressor>
+void BM_CompressBiased(benchmark::State& state) {
   std::string raw;
   int len = 3000;
 
@@ -15,12 +17,13 @@ static void BM_CompressBiased(benchmark::State& state) {
   }
 
   for (auto _ : state) {
-    std::string compressed = huffman::Compress(raw);
+    std::string compressed = Compressor::Compress(raw);
   }
   state.SetBytesProcessed(state.iterations() * len);
 }
 
-static void BM_CompressUniform(benchmark::State& state) {
+template <typename Compressor>
+void BM_CompressUniform(benchmark::State& state) {
   std::string raw;
   int len = 3000;
 
@@ -29,12 +32,13 @@ static void BM_CompressUniform(benchmark::State& state) {
   }
 
   for (auto _ : state) {
-    std::string compressed = huffman::Compress(raw);
+    std::string compressed = Compressor::Compress(raw);
   }
   state.SetBytesProcessed(state.iterations() * len);
 }
 
-static void BM_DecompressBiased(benchmark::State& state) {
+template <typename Compressor>
+void BM_DecompressBiased(benchmark::State& state) {
   std::string raw;
   int len = 3000;
 
@@ -42,14 +46,15 @@ static void BM_DecompressBiased(benchmark::State& state) {
     raw.push_back(uint8_t(rand() & rand() & rand()));
     // raw.push_back(uint8_t(rand()));
   }
-  std::string compressed = huffman::Compress(raw);
+  std::string compressed = Compressor::Compress(raw);
   for (auto _ : state) {
-    std::string decompressed = huffman::Decompress(compressed);
+    std::string decompressed = Compressor::Decompress(compressed);
   }
   state.SetBytesProcessed(state.iterations() * len);
 }
 
-static void BM_DecompressUniform(benchmark::State& state) {
+template <typename Compressor>
+void BM_DecompressUniform(benchmark::State& state) {
   std::string raw;
   int len = 3000;
 
@@ -57,14 +62,15 @@ static void BM_DecompressUniform(benchmark::State& state) {
     raw.push_back(uint8_t(rand()));
   }
 
-  std::string compressed = huffman::Compress(raw);
+  std::string compressed = Compressor::Compress(raw);
   for (auto _ : state) {
-    std::string decompressed = huffman::Decompress(compressed);
+    std::string decompressed = Compressor::Decompress(compressed);
   }
   state.SetBytesProcessed(state.iterations() * len);
 }
 
-static void BM_CompressShort(benchmark::State& state) {
+template <typename Compressor>
+void BM_CompressShort(benchmark::State& state) {
   std::string raw;
   int len = 100;
 
@@ -73,12 +79,13 @@ static void BM_CompressShort(benchmark::State& state) {
   }
 
   for (auto _ : state) {
-    std::string compressed = huffman::Compress(raw);
+    std::string compressed = Compressor::Compress(raw);
   }
   state.SetBytesProcessed(state.iterations() * len);
 }
 
-static void BM_DecompressShort(benchmark::State& state) {
+template <typename Compressor>
+void BM_DecompressShort(benchmark::State& state) {
   std::string raw;
   int len = 100;
 
@@ -86,14 +93,15 @@ static void BM_DecompressShort(benchmark::State& state) {
     raw.push_back(uint8_t(rand() & rand() & rand()));
   }
 
-  std::string compressed = huffman::Compress(raw);
+  std::string compressed = Compressor::Compress(raw);
   for (auto _ : state) {
-    std::string decompressed = huffman::Decompress(compressed);
+    std::string decompressed = Compressor::Decompress(compressed);
   }
   state.SetBytesProcessed(state.iterations() * len);
 }
 
-static void BM_CompressLong(benchmark::State& state) {
+template <typename Compressor>
+void BM_CompressLong(benchmark::State& state) {
   std::string raw;
   int len = 100000;
 
@@ -102,12 +110,13 @@ static void BM_CompressLong(benchmark::State& state) {
   }
 
   for (auto _ : state) {
-    std::string compressed = huffman::Compress(raw);
+    std::string compressed = Compressor::Compress(raw);
   }
   state.SetBytesProcessed(state.iterations() * len);
 }
 
-static void BM_DecompressLong(benchmark::State& state) {
+template <typename Compressor>
+void BM_DecompressLong(benchmark::State& state) {
   std::string raw;
   int len = 100000;
 
@@ -115,19 +124,24 @@ static void BM_DecompressLong(benchmark::State& state) {
     raw.push_back(uint8_t(rand() & rand() & rand()));
   }
 
-  std::string compressed = huffman::Compress(raw);
+  std::string compressed = Compressor::Compress(raw);
   for (auto _ : state) {
-    std::string decompressed = huffman::Decompress(compressed);
+    std::string decompressed = Compressor::Decompress(compressed);
   }
   state.SetBytesProcessed(state.iterations() * len);
 }
+}  // namespace
 
-BENCHMARK(BM_CompressBiased);
-BENCHMARK(BM_CompressUniform);
-BENCHMARK(BM_CompressShort);
-BENCHMARK(BM_CompressLong);
+#define DEFINE_BENCHMARKS(TYPE)          \
+  BENCHMARK(BM_CompressBiased<TYPE>);    \
+  BENCHMARK(BM_CompressUniform<TYPE>);   \
+  BENCHMARK(BM_CompressShort<TYPE>);     \
+  BENCHMARK(BM_CompressLong<TYPE>);      \
+  BENCHMARK(BM_DecompressBiased<TYPE>);  \
+  BENCHMARK(BM_DecompressUniform<TYPE>); \
+  BENCHMARK(BM_DecompressShort<TYPE>);   \
+  BENCHMARK(BM_DecompressLong<TYPE>);
 
-BENCHMARK(BM_DecompressBiased);
-BENCHMARK(BM_DecompressUniform);
-BENCHMARK(BM_DecompressShort);
-BENCHMARK(BM_DecompressLong);
+DEFINE_BENCHMARKS(::huffman::HuffmanCompressor)
+DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<2>)
+DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<4>)

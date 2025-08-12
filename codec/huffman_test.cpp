@@ -23,7 +23,10 @@ class NameGenerator {
   }
 };
 
-using Compressors = ::testing::Types<huffman::HuffmanCompressor>;
+using Compressors = ::testing::Types<huffman::HuffmanCompressor,
+      huffman::HuffmanCompressorMulti<2>,
+      huffman::HuffmanCompressorMulti<4>
+      >;
 TYPED_TEST_SUITE(CompressorTest, Compressors, NameGenerator);
 
 TYPED_TEST(CompressorTest, Hello) {
@@ -89,7 +92,8 @@ TYPED_TEST(CompressorTest, ManyRandom) {
     }
     string compressed = TypeParam::Compress(raw);
     string decompressed = TypeParam::Decompress(compressed);
-    EXPECT_EQ(raw, decompressed) << "k = " << k;
+    // Stop at first failure
+    ASSERT_EQ(raw, decompressed) << "k = " << k;
   }
 }
 
