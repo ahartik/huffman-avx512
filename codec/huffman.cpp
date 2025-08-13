@@ -238,8 +238,11 @@ class CodeWriter {
   }
 
   void WriteCode(BitCode code) {
+    assert(free_bits_ >= 32);
+    // XXX: Document this strange interface.
     cur_ |= uint64_t(code.bits) << (free_bits_ - 32);
     free_bits_ -= code.len;
+
     if (free_bits_ <= 32) {
       uint32_t to_write = htonl(cur_ >> 32);
       memcpy(output_, &to_write, 4);
@@ -430,9 +433,19 @@ std::string Compress(std::string_view raw) {
   compressed.resize(header_size + (output_bits + 7) / 8);
 
   CodeWriter writer(&compressed[header_size]);
-  for (uint8_t s : raw) {
-    BitCode code = coding.codes[s];
-    writer.WriteCode(code);
+  const uint8_t* input = reinterpret_cast<const uint8_t*>(raw.data());
+  const uint8_t* end = input + raw.size();
+  while (input + 1 < end) {
+    // We can write two codes of up to 16 bits per each flush.
+    BitCode a = coding.codes[*input++];
+    BitCode b = coding.codes[*input++];
+    BitCode combined;
+    combined.bits = a.bits | (b.bits >> a.len);
+    combined.len = a.len + b.len;
+    writer.WriteCode(combined);
+  }
+  while (input < end) {
+    writer.WriteCode(coding.codes[*input++]);
   }
   writer.Finish();
 
@@ -526,28 +539,36 @@ std::string CompressMulti(std::string_view raw) {
     part_output[k] =
         compressed.data() + header_size + ((k == 0) ? 0 : end_offset[k - 1]);
   }
-  const char* part_input[K];
-  part_input[0] = raw.data();
+  const uint8_t* part_input[K];
+  part_input[0] = reinterpret_cast<const uint8_t*>(raw.data());
   for (int i = 1; i < K; ++i) {
     part_input[i] = part_input[i - 1] + sizes[i - 1];
   }
+  const uint8_t* part_end[K];
+  for (int i = 0; i < K; ++i) {
+    part_end[i] = part_input[i] + sizes[i];
+  }
+
   CodeWriter writer[K];
   for (int k = 0; k < K; ++k) {
     writer[k].Init(part_output[k]);
   }
 
-  for (int i = 0; i < sizes[K - 1]; ++i) {
+  while (part_input[K-1] + 1 < part_end[K-1]) {
 #pragma GCC unroll 8
     for (int k = 0; k < K; ++k) {
-      uint8_t sym = part_input[k][i];
-      BitCode code = coding.codes[sym];
-      writer[k].WriteCode(code);
+      BitCode a = coding.codes[*part_input[k]++];
+      BitCode b = coding.codes[*part_input[k]++];
+      BitCode combined;
+      combined.bits = a.bits | (b.bits >> a.len);
+      combined.len = a.len + b.len;
+      writer[k].WriteCode(combined);
     }
   }
   // Write potential last symbols.
   for (int k = 0; k < K; ++k) {
-    if (sizes[k] > sizes[K - 1]) {
-      uint8_t sym = part_input[k][sizes[k] - 1];
+    while (part_input[k] != part_end[k]) {
+      uint8_t sym = *part_input[k]++;
       BitCode code = coding.codes[sym];
       writer[k].WriteCode(code);
     }
