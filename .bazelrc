@@ -1,6 +1,7 @@
 build --action_env=BAZEL_CXXOPTS="-std=c++20"
 
-#build --copt -march=znver5
+build --copt -mbmi2
+build --copt -march=znver5
 
 test --test_output=errors
 

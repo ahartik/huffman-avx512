@@ -13,12 +13,16 @@
 #include <memory>
 #include <vector>
 
+#include "x86intrin.h"
+
 namespace huffman {
 namespace {
 
 struct BitCode {
   uint16_t bits;
-  int len;
+  // uint16_t mask;
+  int16_t len;
+  // int16_t pad;
 };
 
 #ifdef HUFF_DEBUG
@@ -31,16 +35,19 @@ std::string SymToStr(uint8_t sym) {
   }
 }
 
-void PrintCode(char sym, uint32_t bits, int len) {
-  std::cout << "Sym: " << SymToStr(sym) << ", code: ";
-  if (len < 0 || len > 32) {
+void PrintCode(char sym, uint64_t bits, int len) {
+  std::cout << "Sym: " << SymToStr(sym) << ", code: " << bits << " ";
+  if (len < 0 || len > 64) {
     std::cout << "BAD LEN: " << len << "\n";
     return;
   }
-  for (int i = 0; i < len; ++i) {
-    std::cout << ((bits >> (31 - i)) & 1);
+  for (int i = len - 1; i >= 0; --i) {
+    std::cout << ((bits >> i) & 1);
   }
-  std::cout << "\n";
+  std::cout << "\n" << std::flush;
+  for (int i = len; i < 64; ++i) {
+    assert(((bits >> i) & 1) == 0);
+  }
 }
 #endif
 
@@ -137,24 +144,53 @@ void LimitCodeLengths(uint8_t* len_count) {
   }
 }
 
+void CountSymbols(std::string_view text, int* sym_count) {
+  // Idea copied from Huff0: count in four stripes to maximize superscalar
+  if (text.size() < 1500) {
+    const size_t text_size = text.size();
+    for (size_t i = 0; i < text_size; ++i) {
+      ++sym_count[uint8_t(text[i])];
+    }
+  } else {
+    // 4K, hopefully still fits on the stack.
+    int tmp_count[4][256] = {};
+    const size_t text_size = text.size();
+    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(text.data());
+    const uint8_t* end = ptr + text_size;
+    while (ptr + 3 < end) {
+      ++tmp_count[0][*ptr++];
+      ++tmp_count[1][*ptr++];
+      ++tmp_count[2][*ptr++];
+      ++tmp_count[3][*ptr++];
+    }
+    while (ptr < end) {
+      ++tmp_count[0][*ptr++];
+    }
+    for (int c = 0; c < 256; ++c) {
+      sym_count[c] =
+          tmp_count[0][c] + tmp_count[1][c] + tmp_count[2][c] + tmp_count[3][c];
+    }
+  }
+}
+
 CanonicalCoding MakeCanonicalCoding(std::string_view text) {
   CanonicalCoding coding;
   if (text.empty()) {
     return coding;
   }
-  for (const unsigned char c : text) {
-    ++coding.sym_count[c];
-  }
+  CountSymbols(text, coding.sym_count);
+
   std::vector<Node> heap;
   std::vector<Node> tree;
-  std::vector<uint8_t> syms;
+  heap.reserve(256);
   for (int c = 0; c < 256; ++c) {
     if (coding.sym_count[c] != 0) {
       Node node;
       node.count = coding.sym_count[c];
       node.sym = uint8_t(c);
-      syms.push_back(node.sym);
       heap.push_back(node);
+      coding.sorted_syms[coding.num_syms] = node.sym;
+      ++coding.num_syms;
     }
   }
 
@@ -183,9 +219,10 @@ CanonicalCoding MakeCanonicalCoding(std::string_view text) {
   // Build "canonical Huffman code".
 
   // Sort the symbols in decreasing order of frequency.
-  std::sort(syms.begin(), syms.end(), [&](uint8_t a, uint8_t b) {
-    return coding.sym_count[a] > coding.sym_count[b];
-  });
+  std::sort(coding.sorted_syms, coding.sorted_syms + coding.num_syms,
+            [&](uint8_t a, uint8_t b) {
+              return coding.sym_count[a] > coding.sym_count[b];
+            });
 
   LimitCodeLengths(coding.len_count);
 
@@ -194,8 +231,6 @@ CanonicalCoding MakeCanonicalCoding(std::string_view text) {
       coding.len_mask |= 1ull << i;
     }
   }
-  std::copy(syms.begin(), syms.end(), coding.sorted_syms);
-  coding.num_syms = syms.size();
 
   int current_len = 0;
   int current_len_count = 0;
@@ -209,9 +244,10 @@ CanonicalCoding MakeCanonicalCoding(std::string_view text) {
       current_len_count = 0;
     }
     coding.codes[sym].len = current_len;
-    coding.codes[sym].bits = current_code;
+    coding.codes[sym].bits = current_code >> (16 - current_len);
+    // coding.codes[sym].mask = (1 << current_len) - 1;
 #ifdef HUFF_DEBUG
-    PrintCode(sym, current_code, current_len);
+    PrintCode(sym, coding.codes[sym].bits, current_len);
 #endif
     current_code += current_inc;
     ++current_len_count;
@@ -239,7 +275,7 @@ class CodeWriter {
 
   void WriteCode(BitCode code) {
 #if 1
-    WriteLongCode(uint64_t(code.bits) << 48, code.len);
+    WriteLongCode(uint64_t(code.bits), code.len);
 #else
     assert(free_bits_ >= 32);
     // XXX: Document this strange interface.
@@ -257,8 +293,29 @@ class CodeWriter {
   }
 
   void WriteLongCode(uint64_t bits, int num_bits) {
-    assert(free_bits_ > 0);
+    // assert(free_bits_ > 0);
     assert(free_bits_ <= 64);
+    if (free_bits_ <= num_bits) {
+      // Write top bits and flush
+      cur_ |= bits >> (num_bits - free_bits_);
+
+      // std::cout << std::format("WROTE {:64b}\n", cur_);
+      uint64_t to_write = __builtin_bswap64(cur_);
+      memcpy(output_, &to_write, 8);
+      output_ += 8;
+      if (free_bits_ == num_bits) {
+        // Avoid shift by 64
+        cur_ = 0;
+      } else {
+        // Shift off bits we already wrote
+        cur_ = bits << (64 - num_bits + free_bits_);
+      }
+      free_bits_ += 64 - num_bits;
+    } else {
+      cur_ |= bits << (free_bits_ - num_bits);
+      free_bits_ -= num_bits;
+    }
+#if 0
     cur_ |= (bits >> (64 - free_bits_));
     if (free_bits_ <= num_bits) {
       // All bits have been used now, time to flush bytes.
@@ -275,6 +332,60 @@ class CodeWriter {
       free_bits_ += 64;
     }
     free_bits_ -= num_bits;
+#endif
+  }
+
+  void Flush() {
+    int num_bits = 64 - free_bits_;
+    int num_bytes = num_bits >> 3;
+    assert(num_bytes < 8);
+    // std::cout << std::format("WROTE {:64b} num_bytes={}\n", cur_, num_bytes);
+    uint64_t to_write = __builtin_bswap64(cur_);
+    // XXX: Faster if we always write 8 bytes
+    // memcpy(output_, &to_write, num_bytes);
+    memcpy(output_, &to_write, 8);
+    output_ += num_bytes;
+    cur_ <<= 8 * num_bytes;
+    free_bits_ += 8 * num_bytes;
+  }
+
+  void WriteFast(BitCode code) {
+    assert(free_bits_ >= code.len);
+    cur_ |= uint64_t(code.bits) << (free_bits_ - code.len);
+    free_bits_ -= code.len;
+  }
+
+  void WriteFourCodes(BitCode a, BitCode b, BitCode c, BitCode d) {
+#if 0
+    uint64_t bits = uint64_t(a.bits);
+
+    bits <<= b.len;
+    bits |= uint64_t(b.bits);
+
+    bits <<= c.len;
+    bits |= uint64_t(c.bits);
+
+    bits <<= d.len;
+    bits |= uint64_t(d.bits);
+    int len = a.len + b.len + c.len + d.len;
+    WriteLongCode(bits, len);
+#elif 1
+    Flush();
+    // Now we have at least 56 bits to use
+    WriteFast(a);
+    WriteFast(b);
+    Flush();
+    WriteFast(c);
+    WriteFast(d);
+#else
+    uint64_t bits = (uint64_t(a.bits) << 48) | (uint64_t(b.bits) << 32) |
+                    (uint64_t(c.bits) << 16) | (uint64_t(d.bits));
+    uint64_t mask = (uint64_t(a.mask) << 48) | (uint64_t(b.mask) << 32) |
+                    (uint64_t(c.mask) << 16) | (uint64_t(d.mask));
+    bits = _pext_u64(bits, mask);
+    int len = a.len + b.len + c.len + d.len;
+    WriteLongCode(bits, len);
+#endif
   }
 
   void Finish() {
@@ -454,32 +565,29 @@ std::string Compress(std::string_view raw) {
   compressed.append(reinterpret_cast<char*>(coding.sorted_syms),
                     coding.num_syms);
   const int header_size = compressed.size();
-  compressed.resize(header_size + (output_bits + 7) / 8);
+  const int kSlop = 7;
+  compressed.resize(header_size + (output_bits + 7) / 8 + kSlop);
 
   CodeWriter writer(&compressed[header_size]);
   const uint8_t* input = reinterpret_cast<const uint8_t*>(raw.data());
   const uint8_t* end = input + raw.size();
-  while (input + 3 < end) {
-    // We can write four codes of up to 16 bits per each flush.
+  while (input + 2 < end) {
+    // We can write three codes of up to 16 bits per each flush.
     BitCode a = coding.codes[*input++];
     BitCode b = coding.codes[*input++];
     BitCode c = coding.codes[*input++];
-    BitCode d = coding.codes[*input++];
-    assert(a.len <= 16);
-    assert(b.len <= 16);
-    assert(c.len <= 16);
-    assert(d.len <= 16);
-    uint64_t code = (uint64_t(a.bits) << 48) |
-                    (uint64_t(b.bits) << (48 - a.len)) |
-                    (uint64_t(c.bits) << (48 - a.len - b.len)) |
-                    (uint64_t(d.bits) << (48 - a.len - b.len - c.len));
-    writer.WriteLongCode(code, a.len + b.len + c.len + d.len);
+    // BitCode d = coding.codes[*input++];
+    writer.Flush();
+    writer.WriteFast(a);
+    writer.WriteFast(b);
+    writer.WriteFast(c);
   }
   while (input < end) {
     writer.WriteCode(coding.codes[*input++]);
   }
   writer.Finish();
 
+  compressed.resize(compressed.size() - kSlop);
   return compressed;
 }
 
@@ -521,7 +629,19 @@ std::string CompressMulti(std::string_view raw) {
   for (size_t i = 0; i < raw.size() % K; ++i) {
     ++sizes[i];
   }
-  // Compute starting positions for each part.
+  // Start/end input pointers for each part.
+  const uint8_t* part_input[K];
+  part_input[0] = reinterpret_cast<const uint8_t*>(raw.data());
+  for (int i = 1; i < K; ++i) {
+    part_input[i] = part_input[i - 1] + sizes[i - 1];
+  }
+  const uint8_t* part_end[K];
+  for (int i = 0; i < K; ++i) {
+    part_end[i] = part_input[i] + sizes[i];
+  }
+
+  const int kSlop = 7;
+  // Compute starting positions for each part in the output.
   int end_offset[K] = {};
   {
     int pos = 0;
@@ -531,7 +651,7 @@ std::string CompressMulti(std::string_view raw) {
         num_bits += coding.codes[uint8_t(raw[pos + i])].len;
       }
       pos += sizes[part];
-      end_offset[part] = (num_bits + 7) / 8;
+      end_offset[part] = (num_bits + 7) / 8 + kSlop;
     }
   }
   for (int i = 1; i < K; ++i) {
@@ -540,7 +660,7 @@ std::string CompressMulti(std::string_view raw) {
 
   // TODO: Use varints
   const size_t header_size =
-      4 + 4 + CountBits(coding.len_mask) + coding.num_syms + (K - 1) * 4;
+      4 + 4 + CountBits(coding.len_mask) + coding.num_syms + (K - 1) * (4);
   const size_t compressed_size = header_size + end_offset[K - 1];
   std::string compressed;
   compressed.reserve(compressed_size);
@@ -570,38 +690,32 @@ std::string CompressMulti(std::string_view raw) {
     part_output[k] =
         compressed.data() + header_size + ((k == 0) ? 0 : end_offset[k - 1]);
   }
-  const uint8_t* part_input[K];
-  part_input[0] = reinterpret_cast<const uint8_t*>(raw.data());
-  for (int i = 1; i < K; ++i) {
-    part_input[i] = part_input[i - 1] + sizes[i - 1];
-  }
-  const uint8_t* part_end[K];
-  for (int i = 0; i < K; ++i) {
-    part_end[i] = part_input[i] + sizes[i];
-  }
 
   CodeWriter writer[K];
   for (int k = 0; k < K; ++k) {
     writer[k].Init(part_output[k]);
   }
 
-  while (part_input[K - 1] + 3 < part_end[K - 1]) {
+  while (part_input[K - 1] + 2 < part_end[K - 1]) {
 #pragma GCC unroll 8
     for (int k = 0; k < K; ++k) {
+#if 0
       // We can write four codes of up to 16 bits per each flush.
       BitCode a = coding.codes[*part_input[k]++];
       BitCode b = coding.codes[*part_input[k]++];
       BitCode c = coding.codes[*part_input[k]++];
       BitCode d = coding.codes[*part_input[k]++];
-      assert(a.len <= 16);
-      assert(b.len <= 16);
-      assert(c.len <= 16);
-      assert(d.len <= 16);
-      uint64_t code = (uint64_t(a.bits) << 48) |
-                      (uint64_t(b.bits) << (48 - a.len)) |
-                      (uint64_t(c.bits) << (48 - a.len - b.len)) |
-                      (uint64_t(d.bits) << (48 - a.len - b.len - c.len));
-      writer[k].WriteLongCode(code, a.len + b.len + c.len + d.len);
+      writer[k].WriteFourCodes(a, b, c, d);
+#else
+      // We can write three codes of up to 16 bits per each flush.
+      BitCode a = coding.codes[*part_input[k]++];
+      BitCode b = coding.codes[*part_input[k]++];
+      BitCode c = coding.codes[*part_input[k]++];
+      writer[k].Flush();
+      writer[k].WriteFast(a);
+      writer[k].WriteFast(b);
+      writer[k].WriteFast(c);
+#endif
     }
   }
   // Write potential last symbols.
