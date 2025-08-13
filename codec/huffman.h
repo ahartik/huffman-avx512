@@ -44,4 +44,10 @@ class HuffmanCompressorMulti {
   }
 };
 
+namespace internal {
+
+void CountSymbols(std::string_view text, int* sym_count);
+
+} // namespace internal;
+
 }  // namespace huffman

@@ -122,3 +122,9 @@ TEST(MultiTest, Compress2) {
   }
   printf("\n");
 }
+
+TEST(InternalsTest, CountSymbols) {
+  std::string text = "foofoobarbar";
+  int sym_count[256];
+  ::huffman::internal::CountSymbols(text, sym_count);
+}

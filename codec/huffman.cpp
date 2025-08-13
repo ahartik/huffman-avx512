@@ -16,6 +16,51 @@
 #include "x86intrin.h"
 
 namespace huffman {
+
+namespace internal {
+
+void CountSymbols(std::string_view text, int* sym_count) {
+  // Idea copied from Huff0: count in four stripes to maximize superscalar
+  if (text.size() < 1500) {
+    const size_t text_size = text.size();
+    for (size_t i = 0; i < text_size; ++i) {
+      ++sym_count[uint8_t(text[i])];
+    }
+  } else {
+    // 4K, hopefully still fits on the stack.
+    int tmp_count[4][256] = {};
+    const size_t text_size = text.size();
+    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(text.data());
+    const uint8_t* end = ptr + text_size;
+    // TODO: This complexity is not worth it, make microbenchmarks and simplify
+    // possibly.
+    while (ptr + 7 < end) {
+      uint64_t data;
+      memcpy(&data, ptr, 8);
+      ptr += 8;
+      ++tmp_count[0][data & 0xff];
+      ++tmp_count[1][(data >> 8) & 0xff];
+      ++tmp_count[2][(data >> 16) & 0xff];
+      ++tmp_count[3][(data >> 24) & 0xff];
+      ++tmp_count[0][(data >> 32) & 0xff];
+      ++tmp_count[1][(data >> 40) & 0xff];
+      ++tmp_count[2][(data >> 48) & 0xff];
+      ++tmp_count[3][(data >> 56) & 0xff];
+    }
+    while (ptr < end) {
+      ++tmp_count[0][*ptr++];
+    }
+    for (int c = 0; c < 256; ++c) {
+      sym_count[c] =
+          tmp_count[0][c] + tmp_count[1][c] + tmp_count[2][c] + tmp_count[3][c];
+    }
+  }
+}
+}  // namespace internal
+   //
+
+using namespace huffman::internal;
+
 namespace {
 
 struct BitCode {
@@ -141,35 +186,6 @@ void LimitCodeLengths(uint8_t* len_count) {
       }
     }
     --kraft_total;
-  }
-}
-
-void CountSymbols(std::string_view text, int* sym_count) {
-  // Idea copied from Huff0: count in four stripes to maximize superscalar
-  if (text.size() < 1500) {
-    const size_t text_size = text.size();
-    for (size_t i = 0; i < text_size; ++i) {
-      ++sym_count[uint8_t(text[i])];
-    }
-  } else {
-    // 4K, hopefully still fits on the stack.
-    int tmp_count[4][256] = {};
-    const size_t text_size = text.size();
-    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(text.data());
-    const uint8_t* end = ptr + text_size;
-    while (ptr + 3 < end) {
-      ++tmp_count[0][*ptr++];
-      ++tmp_count[1][*ptr++];
-      ++tmp_count[2][*ptr++];
-      ++tmp_count[3][*ptr++];
-    }
-    while (ptr < end) {
-      ++tmp_count[0][*ptr++];
-    }
-    for (int c = 0; c < 256; ++c) {
-      sym_count[c] =
-          tmp_count[0][c] + tmp_count[1][c] + tmp_count[2][c] + tmp_count[3][c];
-    }
   }
 }
 
@@ -388,6 +404,20 @@ class CodeWriter {
 #endif
   }
 
+  void WriteThreeCodes(BitCode a, BitCode b, BitCode c) {
+    Flush();
+
+    uint64_t bits = a.bits;
+    bits <<= b.len;
+    bits |= b.bits;
+    bits <<= c.len;
+    bits |= c.bits;
+
+    int len = a.len + b.len + c.len;
+    cur_ |= bits << (free_bits_ - len);
+    free_bits_ -= len;
+  }
+
   void Finish() {
     while (free_bits_ < 64) {
       uint8_t top = cur_ >> 56;
@@ -457,6 +487,11 @@ class CodeReader {
   const char* end_;
   uint64_t buf_bits_;
   int buf_len_;
+};
+
+struct DecodedSym {
+  uint8_t sym;
+  uint8_t len;
 };
 
 class Decoder {
@@ -571,16 +606,16 @@ std::string Compress(std::string_view raw) {
   CodeWriter writer(&compressed[header_size]);
   const uint8_t* input = reinterpret_cast<const uint8_t*>(raw.data());
   const uint8_t* end = input + raw.size();
+
+  // This pragma showed a 2% speedup once.
+#pragma GCC unroll 1
   while (input + 2 < end) {
     // We can write three codes of up to 16 bits per each flush.
     BitCode a = coding.codes[*input++];
     BitCode b = coding.codes[*input++];
     BitCode c = coding.codes[*input++];
     // BitCode d = coding.codes[*input++];
-    writer.Flush();
-    writer.WriteFast(a);
-    writer.WriteFast(b);
-    writer.WriteFast(c);
+    writer.WriteThreeCodes(a,b,c);
   }
   while (input < end) {
     writer.WriteCode(coding.codes[*input++]);
