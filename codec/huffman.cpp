@@ -446,6 +446,7 @@ std::string CompressMulti(std::string_view raw) {
   for (int i = 1; i < K; ++i) {
     end_offset[i] += end_offset[i - 1];
   }
+
   // TODO: Use varints
   const size_t header_size =
       4 + 4 + CountBits(coding.len_mask) + coding.num_syms + (K - 1) * 4;
@@ -454,11 +455,14 @@ std::string CompressMulti(std::string_view raw) {
   compressed.reserve(compressed_size);
   write_u32(compressed, raw.size());
   write_u32(compressed, coding.len_mask);
-  for (uint8_t count : coding.len_count) {
+  for (int len = 0; len < 32; ++len) {
+    int count = coding.len_count[len];
     if (count != 0) {
       compressed.push_back(count);
+      // std::cout << len << " ";
     }
   }
+  // std::cout << "\n";
   compressed.append(reinterpret_cast<char*>(coding.sorted_syms),
                     coding.num_syms);
   for (int k = 0; k < K - 1; ++k) {

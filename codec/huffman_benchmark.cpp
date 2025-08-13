@@ -9,6 +9,7 @@
 namespace {
 template <typename Compressor>
 void BM_CompressBiased(benchmark::State& state) {
+  srand(0);
   std::string raw;
   int len = 3000;
 
@@ -24,6 +25,7 @@ void BM_CompressBiased(benchmark::State& state) {
 
 template <typename Compressor>
 void BM_CompressUniform(benchmark::State& state) {
+  srand(0);
   std::string raw;
   int len = 3000;
 
@@ -39,6 +41,7 @@ void BM_CompressUniform(benchmark::State& state) {
 
 template <typename Compressor>
 void BM_DecompressBiased(benchmark::State& state) {
+  srand(0);
   std::string raw;
   int len = 3000;
 
@@ -55,6 +58,7 @@ void BM_DecompressBiased(benchmark::State& state) {
 
 template <typename Compressor>
 void BM_DecompressUniform(benchmark::State& state) {
+  srand(0);
   std::string raw;
   int len = 3000;
 
@@ -71,6 +75,7 @@ void BM_DecompressUniform(benchmark::State& state) {
 
 template <typename Compressor>
 void BM_CompressShort(benchmark::State& state) {
+  srand(0);
   std::string raw;
   int len = 100;
 
@@ -86,6 +91,7 @@ void BM_CompressShort(benchmark::State& state) {
 
 template <typename Compressor>
 void BM_DecompressShort(benchmark::State& state) {
+  srand(0);
   std::string raw;
   int len = 100;
 
@@ -102,6 +108,7 @@ void BM_DecompressShort(benchmark::State& state) {
 
 template <typename Compressor>
 void BM_CompressLong(benchmark::State& state) {
+  srand(0);
   std::string raw;
   int len = 100000;
 
@@ -117,6 +124,7 @@ void BM_CompressLong(benchmark::State& state) {
 
 template <typename Compressor>
 void BM_DecompressLong(benchmark::State& state) {
+  srand(0);
   std::string raw;
   int len = 100000;
 
