@@ -17,7 +17,7 @@ namespace huffman {
 namespace {
 
 struct BitCode {
-  uint32_t bits;
+  uint16_t bits;
   int len;
 };
 
@@ -90,10 +90,9 @@ struct CanonicalCoding {
   BitCode codes[256] = {};
   uint8_t sorted_syms[256] = {};
   int num_syms = 0;
-  uint8_t len_count[kMaxOptimalCodeLength+1] = {};
+  uint8_t len_count[kMaxOptimalCodeLength + 1] = {};
   uint32_t len_mask = 0;
 };
-
 
 // Tweak code lens to reduce max length to kMaxCodeLength.
 // This uses the "MiniZ" method as described in
@@ -102,21 +101,22 @@ void LimitCodeLengths(uint8_t* len_count) {
   // Tweak code lens to reduce max length.
   // This uses the "MiniZ" method as described in
   // https://create.stephan-brumme.com/length-limited-prefix-codes/#miniz
-  
+
   bool adjustment_required = 0;
-  for (int i = kMaxCodeLength+1; i <= kMaxOptimalCodeLength; ++i) {
+  for (int i = kMaxCodeLength + 1; i <= kMaxOptimalCodeLength; ++i) {
     adjustment_required |= len_count[i] > 0;
     len_count[kMaxCodeLength] += len_count[i];
     len_count[i] = 0;
   }
   uint32_t kraft_total = 0;
   for (int i = 0; i <= kMaxCodeLength; ++i) {
-    kraft_total += (len_count[i] << (kMaxCodeLength - i)) ;
+    kraft_total += (len_count[i] << (kMaxCodeLength - i));
   }
   const uint32_t one = 1 << kMaxCodeLength;
 #ifdef HUFF_DEBUG
-  std::cout << "LimitCodeLengths: adjustment_required " << adjustment_required << "\n";
-  std::cout << "kraft_total: " << kraft_total << " one: " << one  << "\n";
+  std::cout << "LimitCodeLengths: adjustment_required " << adjustment_required
+            << "\n";
+  std::cout << "kraft_total: " << kraft_total << " one: " << one << "\n";
   std::cout << std::flush;
 #endif
   int second_longest_len = kMaxCodeLength - 1;
@@ -127,7 +127,7 @@ void LimitCodeLengths(uint8_t* len_count) {
     while (second_longest_len > 0) {
       if (len_count[second_longest_len] > 0) {
         --len_count[second_longest_len];
-        len_count[second_longest_len+1] += 2;
+        len_count[second_longest_len + 1] += 2;
         break;
       } else {
         --second_longest_len;
@@ -200,7 +200,7 @@ CanonicalCoding MakeCanonicalCoding(std::string_view text) {
   int current_len = 0;
   int current_len_count = 0;
   uint32_t current_code = 0;
-  uint64_t current_inc = 1ull << 32;
+  uint64_t current_inc = 1ull << 16;
   for (int j = 0; j < coding.num_syms; ++j) {
     uint8_t sym = coding.sorted_syms[j];
     while (current_len_count == coding.len_count[current_len]) {
@@ -221,7 +221,7 @@ CanonicalCoding MakeCanonicalCoding(std::string_view text) {
   std::cout << "compress: current_code at the end: " << current_code << "\n"
             << std::flush;
 #endif
-  assert(current_code == 0);
+  assert(current_code == (1ull << 16));
   return coding;
 }
 
@@ -238,9 +238,12 @@ class CodeWriter {
   }
 
   void WriteCode(BitCode code) {
+#if 1
+    WriteLongCode(uint64_t(code.bits) << 48, code.len);
+#else
     assert(free_bits_ >= 32);
     // XXX: Document this strange interface.
-    cur_ |= uint64_t(code.bits) << (free_bits_ - 32);
+    cur_ |= uint64_t(code.bits) << (free_bits_ - 16);
     free_bits_ -= code.len;
 
     if (free_bits_ <= 32) {
@@ -250,13 +253,34 @@ class CodeWriter {
       free_bits_ += 32;
       cur_ <<= 32;
     }
+#endif
+  }
+
+  void WriteLongCode(uint64_t bits, int num_bits) {
+    assert(free_bits_ > 0);
+    assert(free_bits_ <= 64);
+    cur_ |= (bits >> (64 - free_bits_));
+    if (free_bits_ <= num_bits) {
+      // All bits have been used now, time to flush bytes.
+      uint64_t to_write = __builtin_bswap64(cur_);
+      memcpy(output_, &to_write, 8);
+      output_ += 8;
+      // Previously free bits were already written, shift them out to the left.
+      if (free_bits_ != 64) {
+        // Must avoid shift by 64, that's undefined behavior.
+        cur_ = (bits << free_bits_);
+      } else {
+        cur_ = 0;
+      }
+      free_bits_ += 64;
+    }
+    free_bits_ -= num_bits;
   }
 
   void Finish() {
     while (free_bits_ < 64) {
       uint8_t top = cur_ >> 56;
-      *output_ = top;
-      ++output_;
+      *output_++ = top;
       cur_ <<= 8;
       free_bits_ += 8;
     }
@@ -265,7 +289,7 @@ class CodeWriter {
  private:
   char* output_;
   uint64_t cur_;
-  uint64_t free_bits_;
+  int free_bits_;
 };
 
 class CodeReader {
@@ -435,14 +459,21 @@ std::string Compress(std::string_view raw) {
   CodeWriter writer(&compressed[header_size]);
   const uint8_t* input = reinterpret_cast<const uint8_t*>(raw.data());
   const uint8_t* end = input + raw.size();
-  while (input + 1 < end) {
-    // We can write two codes of up to 16 bits per each flush.
+  while (input + 3 < end) {
+    // We can write four codes of up to 16 bits per each flush.
     BitCode a = coding.codes[*input++];
     BitCode b = coding.codes[*input++];
-    BitCode combined;
-    combined.bits = a.bits | (b.bits >> a.len);
-    combined.len = a.len + b.len;
-    writer.WriteCode(combined);
+    BitCode c = coding.codes[*input++];
+    BitCode d = coding.codes[*input++];
+    assert(a.len <= 16);
+    assert(b.len <= 16);
+    assert(c.len <= 16);
+    assert(d.len <= 16);
+    uint64_t code = (uint64_t(a.bits) << 48) |
+                    (uint64_t(b.bits) << (48 - a.len)) |
+                    (uint64_t(c.bits) << (48 - a.len - b.len)) |
+                    (uint64_t(d.bits) << (48 - a.len - b.len - c.len));
+    writer.WriteLongCode(code, a.len + b.len + c.len + d.len);
   }
   while (input < end) {
     writer.WriteCode(coding.codes[*input++]);
@@ -554,15 +585,23 @@ std::string CompressMulti(std::string_view raw) {
     writer[k].Init(part_output[k]);
   }
 
-  while (part_input[K-1] + 1 < part_end[K-1]) {
+  while (part_input[K - 1] + 3 < part_end[K - 1]) {
 #pragma GCC unroll 8
     for (int k = 0; k < K; ++k) {
+      // We can write four codes of up to 16 bits per each flush.
       BitCode a = coding.codes[*part_input[k]++];
       BitCode b = coding.codes[*part_input[k]++];
-      BitCode combined;
-      combined.bits = a.bits | (b.bits >> a.len);
-      combined.len = a.len + b.len;
-      writer[k].WriteCode(combined);
+      BitCode c = coding.codes[*part_input[k]++];
+      BitCode d = coding.codes[*part_input[k]++];
+      assert(a.len <= 16);
+      assert(b.len <= 16);
+      assert(c.len <= 16);
+      assert(d.len <= 16);
+      uint64_t code = (uint64_t(a.bits) << 48) |
+                      (uint64_t(b.bits) << (48 - a.len)) |
+                      (uint64_t(c.bits) << (48 - a.len - b.len)) |
+                      (uint64_t(d.bits) << (48 - a.len - b.len - c.len));
+      writer[k].WriteLongCode(code, a.len + b.len + c.len + d.len);
     }
   }
   // Write potential last symbols.
