@@ -55,12 +55,12 @@ struct Node {
 };
 
 void get_code_len(const std::vector<Node>& tree, const Node* node, int len,
-                  uint8_t* code_len) {
+                  uint8_t* len_count) {
   if (node->children[0] == node->children[1]) {
-    code_len[node->sym] = len;
+    ++len_count[len];
   } else {
-    get_code_len(tree, &tree[node->children[0]], len + 1, code_len);
-    get_code_len(tree, &tree[node->children[1]], len + 1, code_len);
+    get_code_len(tree, &tree[node->children[0]], len + 1, len_count);
+    get_code_len(tree, &tree[node->children[1]], len + 1, len_count);
   }
 }
 
@@ -79,15 +79,63 @@ uint32_t read_u32(std::string_view& in) {
   return x;
 }
 
+// Maximum code length we want to use.
+const int kMaxCodeLength = 16;
+// Maximum code length that would be optimal in terms of compression.  We use
+// shorter codes with slightly worse compression to gain better performance.
+const int kMaxOptimalCodeLength = 32;
+
 struct CanonicalCoding {
   int sym_count[256] = {};
-  uint8_t code_len[256] = {};
   BitCode codes[256] = {};
   uint8_t sorted_syms[256] = {};
   int num_syms = 0;
-  uint8_t len_count[32] = {};
+  uint8_t len_count[kMaxOptimalCodeLength+1] = {};
   uint32_t len_mask = 0;
 };
+
+
+// Tweak code lens to reduce max length to kMaxCodeLength.
+// This uses the "MiniZ" method as described in
+// https://create.stephan-brumme.com/length-limited-prefix-codes/#miniz
+void LimitCodeLengths(uint8_t* len_count) {
+  // Tweak code lens to reduce max length.
+  // This uses the "MiniZ" method as described in
+  // https://create.stephan-brumme.com/length-limited-prefix-codes/#miniz
+  
+  bool adjustment_required = 0;
+  for (int i = kMaxCodeLength+1; i <= kMaxOptimalCodeLength; ++i) {
+    adjustment_required |= len_count[i] > 0;
+    len_count[kMaxCodeLength] += len_count[i];
+    len_count[i] = 0;
+  }
+  uint32_t kraft_total = 0;
+  for (int i = 0; i <= kMaxCodeLength; ++i) {
+    kraft_total += (len_count[i] << (kMaxCodeLength - i)) ;
+  }
+  const uint32_t one = 1 << kMaxCodeLength;
+#ifdef HUFF_DEBUG
+  std::cout << "LimitCodeLengths: adjustment_required " << adjustment_required << "\n";
+  std::cout << "kraft_total: " << kraft_total << " one: " << one  << "\n";
+  std::cout << std::flush;
+#endif
+  int second_longest_len = kMaxCodeLength - 1;
+  while (kraft_total > one) {
+    // Decrease the length of one code with the maximum length.
+    --len_count[kMaxCodeLength];
+    // Increase the length for some code with currently a shorter length.
+    while (second_longest_len > 0) {
+      if (len_count[second_longest_len] > 0) {
+        --len_count[second_longest_len];
+        len_count[second_longest_len+1] += 2;
+        break;
+      } else {
+        --second_longest_len;
+      }
+    }
+    --kraft_total;
+  }
+}
 
 CanonicalCoding MakeCanonicalCoding(std::string_view text) {
   CanonicalCoding coding;
@@ -131,50 +179,49 @@ CanonicalCoding MakeCanonicalCoding(std::string_view text) {
     heap.push_back(next);
     std::push_heap(heap.begin(), heap.end());
   }
-  get_code_len(tree, &heap[0], 0, coding.code_len);
-
+  get_code_len(tree, &heap[0], 0, coding.len_count);
   // Build "canonical Huffman code".
 
-  // Sort the symbols in increasing order of code length using a counting sort.
-  for (uint8_t sym : syms) {
-    int len = coding.code_len[sym];
-    ++coding.len_count[len];
-    coding.len_mask |= 1 << len;
+  // Sort the symbols in decreasing order of frequency.
+  std::sort(syms.begin(), syms.end(), [&](uint8_t a, uint8_t b) {
+    return coding.sym_count[a] > coding.sym_count[b];
+  });
+
+  LimitCodeLengths(coding.len_count);
+
+  for (int i = 0; i <= kMaxCodeLength; ++i) {
+    if (coding.len_count[i] != 0) {
+      coding.len_mask |= 1ull << i;
+    }
   }
-  uint8_t cum_len_count[32] = {};
-  for (int i = 0; i < 31; ++i) {
-    cum_len_count[i + 1] = cum_len_count[i] + coding.len_count[i];
-  }
-  for (uint8_t sym : syms) {
-    int len = coding.code_len[sym];
-    coding.sorted_syms[cum_len_count[len]++] = sym;
-  }
+  std::copy(syms.begin(), syms.end(), coding.sorted_syms);
   coding.num_syms = syms.size();
 
   int current_len = 0;
+  int current_len_count = 0;
   uint32_t current_code = 0;
-  uint32_t current_inc = 1 << 31;
+  uint64_t current_inc = 1ull << 32;
   for (int j = 0; j < coding.num_syms; ++j) {
     uint8_t sym = coding.sorted_syms[j];
-    int len = coding.code_len[sym];
-    if (current_len != len) {
-      assert(current_len < len);
-      // current_code <<= (len - current_len);
-      current_len = len;
-      current_inc = 1 << (32 - len);
+    while (current_len_count == coding.len_count[current_len]) {
+      ++current_len;
+      current_inc >>= 1;
+      current_len_count = 0;
     }
-    assert(len >= 0);
-    assert(len <= 32);
-    coding.codes[sym].len = len;
+    coding.codes[sym].len = current_len;
     coding.codes[sym].bits = current_code;
 #ifdef HUFF_DEBUG
-    PrintCode(sym, current_code, len);
+    PrintCode(sym, current_code, current_len);
 #endif
     current_code += current_inc;
+    ++current_len_count;
   }
+  // Code should wrap around perfectly once.
 #ifdef HUFF_DEBUG
-  std::cout << "compress: current_code at the end: " << current_code << "\n";
+  std::cout << "compress: current_code at the end: " << current_code << "\n"
+            << std::flush;
 #endif
+  assert(current_code == 0);
   return coding;
 }
 
@@ -437,7 +484,7 @@ std::string CompressMulti(std::string_view raw) {
     for (int part = 0; part < K; ++part) {
       int64_t num_bits = 0;
       for (int i = 0; i < sizes[part]; ++i) {
-        num_bits += coding.code_len[uint8_t(raw[pos + i])];
+        num_bits += coding.codes[uint8_t(raw[pos + i])].len;
       }
       pos += sizes[part];
       end_offset[part] = (num_bits + 7) / 8;
@@ -490,7 +537,7 @@ std::string CompressMulti(std::string_view raw) {
   }
 
   for (int i = 0; i < sizes[K - 1]; ++i) {
-   #pragma GCC unroll 8
+#pragma GCC unroll 8
     for (int k = 0; k < K; ++k) {
       uint8_t sym = part_input[k][i];
       BitCode code = coding.codes[sym];
@@ -561,7 +608,7 @@ std::string DecompressMulti(std::string_view compressed) {
   }
 
   for (int i = 0; i < sizes[K - 1]; ++i) {
-   #pragma GCC unroll 8
+#pragma GCC unroll 8
     for (int k = 0; k < K; ++k) {
       const uint32_t code = reader[k].GetTopBits();
       uint8_t sym;

@@ -68,6 +68,18 @@ TYPED_TEST(CompressorTest, SingleSymbolOnly) {
   EXPECT_EQ("AAA", decompressed);
 }
 
+TYPED_TEST(CompressorTest, LongCodes) {
+  string text;
+  for (int i = 0; i < 20; ++i) {
+    for (int j = 0; j < (1<<i); ++j) {
+      text.push_back('A' + i);
+    }
+  }
+  string compressed = TypeParam::Compress(text);
+  string decompressed = TypeParam::Decompress(compressed);
+  EXPECT_EQ(text, decompressed);
+}
+
 #if 1
 TYPED_TEST(CompressorTest, EmptyString) {
   string compressed = TypeParam::Compress("");
