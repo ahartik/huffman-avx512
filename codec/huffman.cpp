@@ -70,6 +70,38 @@ inline uint64_t ToBigEndian64(uint64_t x) { return __builtin_bswap64(x); }
 
 inline uint64_t FromBigEndian64(uint64_t x) { return __builtin_bswap64(x); }
 
+inline uint64_t ReverseBits64(uint64_t x) {
+  // https://graphics.stanford.edu/%7Eseander/bithacks.html#ReverseParallel
+
+  const uint64_t bits55 = 0x5555555555555555ull;
+  const uint64_t bits33 = 0x3333333333333333ull;
+  const uint64_t bits0f = 0x0f0f0f0f0f0f0f0full;
+  // Swap odd and even bits
+  x = ((x >> 1) & bits55) | ((x & bits55) << 1);
+  // swap consecutixe pairs
+  x = ((x >> 2) & bits33) | ((x & bits33) << 2);
+  // // swap nibbles ...
+  x = ((x >> 4) & bits0f) | ((x & bits0f) << 4);
+  // Bytes can be reversed with this instruction instead.
+  return __builtin_bswap64(x);
+}
+
+inline uint16_t ReverseBits16(uint16_t x) {
+  // https://graphics.stanford.edu/%7Eseander/bithacks.html#ReverseParallel
+
+  const uint16_t bits55 = 0x5555;
+  const uint16_t bits33 = 0x3333;
+  const uint16_t bits0f = 0x0f0f;
+  // Swap odd and even bits
+  x = ((x >> 1) & bits55) | ((x & bits55) << 1);
+  // swap consecutixe pairs
+  x = ((x >> 2) & bits33) | ((x & bits33) << 2);
+  // // swap nibbles ...
+  x = ((x >> 4) & bits0f) | ((x & bits0f) << 4);
+  // Reverse the two bytes:
+  return (x >> 8) | (x << 8);
+}
+
 struct BitCode {
   uint16_t bits;
   // uint16_t mask;
@@ -267,7 +299,7 @@ CanonicalCoding MakeCanonicalCoding(std::string_view text) {
       current_len_count = 0;
     }
     coding.codes[sym].len = current_len;
-    coding.codes[sym].bits = current_code >> (16 - current_len);
+    coding.codes[sym].bits = ReverseBits16(current_code);
     // coding.codes[sym].mask = (1 << current_len) - 1;
 #ifdef HUFF_DEBUG
     PrintCode(sym, coding.codes[sym].bits, current_len);
@@ -286,141 +318,57 @@ CanonicalCoding MakeCanonicalCoding(std::string_view text) {
 
 class CodeWriter {
  public:
-  explicit CodeWriter(char* output)
-      : output_(output), cur_(0), free_bits_(64) {}
-  CodeWriter() : output_(nullptr), cur_(0), free_bits_(64) {}
+  explicit CodeWriter(char* output) { Init(output); }
+
+  CodeWriter() { Init(nullptr); }
 
   void Init(char* output) {
     output_ = output;
-    cur_ = 0;
-    free_bits_ = 64;
+    buf_ = 0;
+    buf_size_ = 0;
   }
 
   void WriteCode(BitCode code) {
-#if 1
-    WriteLongCode(uint64_t(code.bits), code.len);
-#else
-    assert(free_bits_ >= 32);
-    // XXX: Document this strange interface.
-    cur_ |= uint64_t(code.bits) << (free_bits_ - 16);
-    free_bits_ -= code.len;
-
-    if (free_bits_ <= 32) {
-      uint32_t to_write = htonl(cur_ >> 32);
-      memcpy(output_, &to_write, 4);
-      output_ += 4;
-      free_bits_ += 32;
-      cur_ <<= 32;
-    }
-#endif
-  }
-
-  void WriteLongCode(uint64_t bits, int num_bits) {
-    // assert(free_bits_ > 0);
-    assert(free_bits_ <= 64);
-    if (free_bits_ <= num_bits) {
-      // Write top bits and flush
-      cur_ |= bits >> (num_bits - free_bits_);
-
-      // std::cout << std::format("WROTE {:64b}\n", cur_);
-      uint64_t to_write = __builtin_bswap64(cur_);
-      memcpy(output_, &to_write, 8);
-      output_ += 8;
-      if (free_bits_ == num_bits) {
-        // Avoid shift by 64
-        cur_ = 0;
-      } else {
-        // Shift off bits we already wrote
-        cur_ = bits << (64 - num_bits + free_bits_);
-      }
-      free_bits_ += 64 - num_bits;
-    } else {
-      cur_ |= bits << (free_bits_ - num_bits);
-      free_bits_ -= num_bits;
-    }
+    WriteFast(code);
+    Flush();
   }
 
   void Flush() {
-    int num_bits = 64 - free_bits_;
-    int num_bytes = num_bits >> 3;
-    assert(num_bytes < 8);
-    // std::cout << std::format("WROTE {:64b} num_bytes={}\n", cur_, num_bytes);
-    uint64_t to_write = __builtin_bswap64(cur_);
-    // XXX: Faster if we always write 8 bytes
-    // memcpy(output_, &to_write, num_bytes);
-    memcpy(output_, &to_write, 8);
+    int num_bytes = buf_size_ >> 3;
+    assert(num_bytes <= 8);
+    // This assumes little endian:
+    memcpy(output_, &buf_, 8);
     output_ += num_bytes;
-    cur_ <<= 8 * num_bytes;
-    free_bits_ += 8 * num_bytes;
+    buf_ >>= 8 * num_bytes;
+    buf_size_ -= 8 * num_bytes;
   }
 
   void WriteFast(BitCode code) {
-    assert(free_bits_ >= code.len);
-    cur_ |= uint64_t(code.bits) << (free_bits_ - code.len);
-    free_bits_ -= code.len;
-  }
-
-  void WriteFourCodes(BitCode a, BitCode b, BitCode c, BitCode d) {
-#if 0
-    uint64_t bits = uint64_t(a.bits);
-
-    bits <<= b.len;
-    bits |= uint64_t(b.bits);
-
-    bits <<= c.len;
-    bits |= uint64_t(c.bits);
-
-    bits <<= d.len;
-    bits |= uint64_t(d.bits);
-    int len = a.len + b.len + c.len + d.len;
-    WriteLongCode(bits, len);
-#elif 1
-    Flush();
-    // Now we have at least 56 bits to use
-    WriteFast(a);
-    WriteFast(b);
-    Flush();
-    WriteFast(c);
-    WriteFast(d);
-#else
-    uint64_t bits = (uint64_t(a.bits) << 48) | (uint64_t(b.bits) << 32) |
-                    (uint64_t(c.bits) << 16) | (uint64_t(d.bits));
-    uint64_t mask = (uint64_t(a.mask) << 48) | (uint64_t(b.mask) << 32) |
-                    (uint64_t(c.mask) << 16) | (uint64_t(d.mask));
-    bits = _pext_u64(bits, mask);
-    int len = a.len + b.len + c.len + d.len;
-    WriteLongCode(bits, len);
-#endif
+    assert(code.len + buf_size_ <= 64);
+    buf_ |= uint64_t(code.bits) << buf_size_;
+    buf_size_ += code.len;
   }
 
   void WriteThreeCodes(BitCode a, BitCode b, BitCode c) {
+    WriteFast(a);
+    WriteFast(b);
+    WriteFast(c);
     Flush();
-
-    // This is slightly faster than repeated calls to WriteFast
-    uint64_t bits = a.bits;
-    bits <<= b.len;
-    bits |= b.bits;
-    bits <<= c.len;
-    bits |= c.bits;
-
-    int len = a.len + b.len + c.len;
-    cur_ |= bits << (free_bits_ - len);
-    free_bits_ -= len;
   }
 
   void Finish() {
-    while (free_bits_ < 64) {
-      uint8_t top = cur_ >> 56;
+    while (buf_size_ > 0) {
+      uint8_t top = buf_ & 0xff;
       *output_++ = top;
-      cur_ <<= 8;
-      free_bits_ += 8;
+      buf_ >>= 8;
+      buf_size_ -= 8;
     }
   }
 
  private:
   char* output_;
-  uint64_t cur_;
-  int free_bits_;
+  uint64_t buf_;
+  int buf_size_;
 };
 
 class CodeReader {
@@ -438,13 +386,9 @@ class CodeReader {
     ConsumeBits(0);
   }
 
-  uint32_t GetTopBits() const { return (buf_bits_ >> (32)) & 0xFfffFfff; }
-
-  uint64_t GetTopBits64() const { return buf_bits_; }
+  uint64_t GetFirstBits() const { return buf_bits_; }
 
   void ConsumeBits(int num_bits) {
-    buf_len_ -= num_bits;
-
     uint64_t bytes = 0;
     if (__builtin_expect(input_ + 8 > end_, 0)) {
       int num_bytes_available = end_ - input_;
@@ -455,15 +399,14 @@ class CodeReader {
       memcpy(&bytes, input_, 8);
     }
 
-    bytes = FromBigEndian64(bytes);
-    //   std::cout << std::format("Read {:016x} buf_len_={}\n", bytes, buf_len_)
-    //             << std::flush;
+    buf_len_ -= num_bits;
+    buf_bits_ >>= num_bits;
+
     int num_bytes_to_read = (64 - buf_len_) >> 3;
     assert(buf_len_ >= 0);
     assert(num_bytes_to_read <= 8);
 
-    buf_bits_ <<= num_bits;
-    buf_bits_ |= bytes >> (buf_len_);
+    buf_bits_ |= bytes << buf_len_;
     buf_len_ += num_bytes_to_read * 8;
     assert(buf_len_ <= 64);
     assert(buf_len_ >= 48);
@@ -502,31 +445,15 @@ class Decoder {
         ++current_len;
         current_len_count = 0;
         current_inc >>= 1;
-        // Make sure there are no holes in this array.
-        code_begin_[current_len] = current_code;
       }
-      if (len_syms_[current_len] == nullptr) {
-        len_syms_[current_len] = &syms[i];
-        code_begin_[current_len] = current_code;
-      }
-      assert(current_len <= kMaxCodeLength);
 
-      if (current_len <= 8) {
-        uint32_t x_begin = current_code >> 8;
-        for (uint32_t x = x_begin; x < x_begin + (current_inc >> 8); ++x) {
-          assert(x < 256);
-          len_begin_[x] = current_len;
-          fast_sym_[x] = syms[i];
-        }
-      } else {
-        uint32_t x = current_code >> 8;
-        if (len_begin_[x] == 0) {
-          len_begin_[x] = current_len;
-        }
-      }
       DecodedSym dsym = {syms[i], uint8_t(current_len)};
-      std::fill(dtable_.begin() + current_code,
-                dtable_.begin() + current_code + current_inc, dsym);
+      int num = 0;
+      for (uint32_t code = ReverseBits16(current_code);
+           code < (1 << kMaxCodeLength); code += (1 << current_len)) {
+        dtable_[code] = dsym;
+        ++num;
+      }
 
       current_code += current_inc;
       ++current_len_count;
@@ -538,48 +465,15 @@ class Decoder {
   }
 
   int Decode(uint16_t code, uint8_t* out_sym) const {
-#if 1
     DecodedSym dsym = dtable_[code];
     *out_sym = dsym.sym;
+    //     std::cout << std::format("Decode: {:016B} -> {}, {}\n", code,
+    //     dsym.sym,
+    //                              dsym.code_len);
     return dsym.code_len;
-#else
-    // XXX: For some reason this old code doesn't work after modifying the codes
-    // to be 16 bit.
-    code >>= 16;
-    const int top_byte = code >> 8;
-    int len = len_begin_[top_byte];
-#if 1
-    // This may not be any faster.
-    if (len <= 8) {
-      // Fast path, know the symbol based on the top 8 bits alone.
-      *out_sym = fast_sym_[top_byte];
-      return len;
-    }
-#endif
-    // We don't know the exact length of this code
-    while ((code_begin_[len + 1] != 0) & (code_begin_[len + 1] <= code)) {
-      ++len;
-    }
-#ifdef HUFF_DEBUG
-    std::cout << "code len: " << len << "\n" << std::flush;
-#endif
-    int offset = (code - code_begin_[len]) >> (32 - len);
-    uint8_t sym = len_syms_[len][offset];
-#ifdef HUFF_DEBUG
-    std::cout << std::format("Read {:032B} -> '{}'\n", code, SymToStr(sym));
-    // std::cout << "code_len[sym] = " << int(code_len[sym]) << "\n" <<
-    // std::flush; assert(len == code_len[sym]);
-#endif
-    *out_sym = sym;
-    return len;
-#endif
   }
 
  private:
-  const uint8_t* len_syms_[32] = {};
-  uint32_t code_begin_[32] = {};
-  uint8_t len_begin_[256] = {};
-  uint8_t fast_sym_[256] = {};
   std::vector<DecodedSym> dtable_;
 };
 
@@ -657,20 +551,24 @@ std::string Decompress(std::string_view compressed) {
 
   uint8_t* output = reinterpret_cast<uint8_t*>(raw.data());
   uint8_t* output_end = output + raw_size;
-  // Three symbols at a time
-  while (output + 2 < output_end) {
-    uint64_t code = reader.GetTopBits64();
-    int a_bits = decoder.Decode(code >> 48, output++);
-    code <<= a_bits;
-    int b_bits = decoder.Decode(code >> 48, output++);
-    code <<= b_bits;
-    int c_bits = decoder.Decode(code >> 48, output++);
-    reader.ConsumeBits(a_bits + b_bits + c_bits);
+// Four symbols at a time
+#if 1
+  while (output + 3 < output_end) {
+    uint64_t code = reader.GetFirstBits();
+    int a_bits = decoder.Decode(code & 0xffff, output++);
+    code >>= a_bits;
+    int b_bits = decoder.Decode(code & 0xffff, output++);
+    code >>= b_bits;
+    int c_bits = decoder.Decode(code & 0xffff, output++);
+    code >>= c_bits;
+    int d_bits = decoder.Decode(code & 0xffff, output++);
+    reader.ConsumeBits(a_bits + b_bits + c_bits + d_bits);
   }
+#endif
   // Last symbols
   while (output != output_end) {
-    const uint64_t code = reader.GetTopBits64();
-    int bits_read = decoder.Decode(code >> 48, output++);
+    const uint64_t code = reader.GetFirstBits();
+    int bits_read = decoder.Decode(code & 0xffff, output++);
     reader.ConsumeBits(bits_read);
   }
   return raw;
@@ -754,17 +652,10 @@ std::string CompressMulti(std::string_view raw) {
     writer[k].Init(part_output[k]);
   }
 
+#if 0
   while (part_input[K - 1] + 2 < part_end[K - 1]) {
 #pragma GCC unroll 8
     for (int k = 0; k < K; ++k) {
-#if 0
-      // We can write four codes of up to 16 bits per each flush.
-      BitCode a = coding.codes[*part_input[k]++];
-      BitCode b = coding.codes[*part_input[k]++];
-      BitCode c = coding.codes[*part_input[k]++];
-      BitCode d = coding.codes[*part_input[k]++];
-      writer[k].WriteFourCodes(a, b, c, d);
-#else
       // We can write three codes of up to 16 bits per each flush.
       BitCode a = coding.codes[*part_input[k]++];
       BitCode b = coding.codes[*part_input[k]++];
@@ -773,14 +664,13 @@ std::string CompressMulti(std::string_view raw) {
       writer[k].WriteFast(a);
       writer[k].WriteFast(b);
       writer[k].WriteFast(c);
-#endif
     }
   }
+#endif
   // Write potential last symbols.
   for (int k = 0; k < K; ++k) {
     while (part_input[k] != part_end[k]) {
-      uint8_t sym = *part_input[k]++;
-      BitCode code = coding.codes[sym];
+      BitCode code = coding.codes[*part_input[k]++];
       writer[k].WriteCode(code);
     }
     writer[k].Finish();
@@ -843,29 +733,31 @@ std::string DecompressMulti(std::string_view compressed) {
     part_end[k] = part_output[k] + sizes[k];
   }
 
-  while (part_output[K-1] + 2 < part_end[K-1]) {
+#if 1
+  while (part_output[K - 1] + 3 < part_end[K - 1]) {
 #pragma GCC unroll 8
     for (int k = 0; k < K; ++k) {
-      uint64_t code = reader[k].GetTopBits64();
-      int a_len = decoder.Decode(code >> 48, part_output[k]++);
-      code <<= a_len;
-      int b_len = decoder.Decode(code >> 48, part_output[k]++);
-      code <<= b_len;
-      int c_len = decoder.Decode(code >> 48, part_output[k]++);
-      reader[k].ConsumeBits(a_len + b_len + c_len);
+      uint64_t code = reader[k].GetFirstBits();
+      int a_bits = decoder.Decode(code & 0xffff, part_output[k]++);
+      code >>= a_bits;
+      int b_bits = decoder.Decode(code & 0xffff, part_output[k]++);
+      code >>= b_bits;
+      int c_bits = decoder.Decode(code & 0xffff, part_output[k]++);
+      code >>= c_bits;
+      int d_bits = decoder.Decode(code & 0xffff, part_output[k]++);
+      reader[k].ConsumeBits(a_bits + b_bits + c_bits + d_bits);
+      // reader[k].ConsumeBits(a_bits + b_bits + c_bits);
     }
   }
+#endif
   // Read last symbols.
   for (int k = 0; k < K; ++k) {
     while (part_output[k] != part_end[k]) {
-      const uint32_t code = reader[k].GetTopBits();
-      uint8_t sym;
-      int bits_read = decoder.Decode(code >> 16, &sym);
+      const uint64_t code = reader[k].GetFirstBits();
+      int bits_read = decoder.Decode(code & 0xffff, part_output[k]++);
       reader[k].ConsumeBits(bits_read);
-      *part_output[k] = sym;
-      ++part_output[k];
 #ifdef HUFF_DEBUG
-      std::cout << "Last sym " << k << " : " << SymToStr(sym) << "\n";
+      std::cout << "Last sym " << k << " : " << SymToStr(*(part_output[k]-1)) << "\n";
 #endif
     }
   }

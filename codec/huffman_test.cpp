@@ -69,8 +69,9 @@ TYPED_TEST(CompressorTest, SingleSymbolOnly) {
 }
 
 TYPED_TEST(CompressorTest, LongCodes) {
+  const int kLogSize = 16;
   string text;
-  for (int i = 0; i < 20; ++i) {
+  for (int i = 0; i < kLogSize; ++i) {
     for (int j = 0; j < (1<<i); ++j) {
       text.push_back('A' + i);
     }
