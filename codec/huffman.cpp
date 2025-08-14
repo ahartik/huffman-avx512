@@ -56,6 +56,11 @@ void CountSymbols(std::string_view text, int* sym_count) {
     }
   }
 }
+
+uint64_t ToBigEndian64(uint64_t x) { return __builtin_bswap64(x); }
+
+uint64_t FromBigEndian64(uint64_t x) { return __builtin_bswap64(x); }
+
 }  // namespace internal
    //
 
@@ -331,24 +336,6 @@ class CodeWriter {
       cur_ |= bits << (free_bits_ - num_bits);
       free_bits_ -= num_bits;
     }
-#if 0
-    cur_ |= (bits >> (64 - free_bits_));
-    if (free_bits_ <= num_bits) {
-      // All bits have been used now, time to flush bytes.
-      uint64_t to_write = __builtin_bswap64(cur_);
-      memcpy(output_, &to_write, 8);
-      output_ += 8;
-      // Previously free bits were already written, shift them out to the left.
-      if (free_bits_ != 64) {
-        // Must avoid shift by 64, that's undefined behavior.
-        cur_ = (bits << free_bits_);
-      } else {
-        cur_ = 0;
-      }
-      free_bits_ += 64;
-    }
-    free_bits_ -= num_bits;
-#endif
   }
 
   void Flush() {
@@ -407,6 +394,7 @@ class CodeWriter {
   void WriteThreeCodes(BitCode a, BitCode b, BitCode c) {
     Flush();
 
+    // This is slightly faster than repeated calls to WriteFast
     uint64_t bits = a.bits;
     bits <<= b.len;
     bits |= b.bits;
@@ -435,75 +423,77 @@ class CodeWriter {
 
 class CodeReader {
  public:
-  CodeReader() : input_(nullptr), end_(nullptr), buf_bits_(0), buf_len_(0) {
-    ConsumeBits(0);
-  }
+  CodeReader() { Init(nullptr, 0); }
 
-  CodeReader(const char* input, size_t size)
-      : input_(input), end_(input + size), buf_bits_(0), buf_len_(0) {
-    ConsumeBits(0);
-  }
+  CodeReader(const char* input, size_t size) { Init(input, size); }
 
   void Init(const char* input, size_t size) {
     input_ = input;
     end_ = input + size;
     buf_bits_ = 0;
     buf_len_ = 0;
+    input_bits_used_ = 0;
     ConsumeBits(0);
   }
 
-  uint32_t GetTopBits() const {
-    return (buf_bits_ >> (buf_len_ - 32)) & 0xFfffFfff;
-  }
+  uint32_t GetTopBits() const { return (buf_bits_ >> (32)) & 0xFfffFfff; }
+
+  uint64_t GetTopBits64() const { return buf_bits_; }
 
   void ConsumeBits(int num_bits) {
     buf_len_ -= num_bits;
-    if (buf_len_ < 32) {
-      if (input_ + 4 > end_) {
-        // Special handling for the last bytes of the stream.
-        // All further reads produce zeros.
-        int num_bytes = end_ - input_;
-        uint32_t to_add = 0;
-        if (num_bytes != 0) {
-          memcpy(&to_add, input_, num_bytes);
-        }
-        buf_bits_ <<= 32;
-        buf_bits_ |= ntohl(to_add);
-        buf_len_ += 32;
-        input_ += num_bytes;
-      } else {
-        uint32_t to_add;
-        memcpy(&to_add, input_, 4);
-        buf_bits_ <<= 32;
-        buf_bits_ |= ntohl(to_add);
-        buf_len_ += 32;
-        input_ += 4;
+
+    uint64_t bytes = 0;
+    if (__builtin_expect(input_ + 8 > end_, 0)) {
+      int num_bytes_available = end_ - input_;
+      if (num_bytes_available > 0) {
+        memcpy(&bytes, input_, num_bytes_available);
       }
+    } else {
+      memcpy(&bytes, input_, 8);
     }
+
+    bytes = FromBigEndian64(bytes);
+    //   std::cout << std::format("Read {:016x} buf_len_={}\n", bytes, buf_len_)
+    //             << std::flush;
+    int num_bytes_to_read = (64 - buf_len_) >> 3;
+    assert(buf_len_ >= 0);
+    assert(num_bytes_to_read <= 8);
+
+    buf_bits_ <<= num_bits;
+    buf_bits_ |= bytes >> (buf_len_);
+    buf_len_ += num_bytes_to_read * 8;
+    assert(buf_len_ <= 64);
+    assert(buf_len_ >= 48);
+    //   std::cout << std::format("buf_bits_={:064B}\n", buf_bits_)
+    //             << std::flush;
+    input_ += num_bytes_to_read;
   }
 
  private:
   const char* input_;
   const char* end_;
   uint64_t buf_bits_;
+  int input_bits_used_;
   int buf_len_;
 };
 
 struct DecodedSym {
   uint8_t sym;
-  uint8_t len;
+  uint8_t code_len;
 };
 
 class Decoder {
  public:
-  Decoder(uint8_t* len_count, const uint8_t* syms, int num_syms) {
+  Decoder(uint8_t* len_count, const uint8_t* syms, int num_syms)
+      : dtable_(1 << kMaxCodeLength) {
     // Note that this code also handles the strange case where there is only 1
     // symbol in the compressed text, in which case that symbol is encoded
     // using 0 bits.
     int current_len = 0;
     int current_len_count = 0;
     uint32_t current_code = 0;
-    uint64_t current_inc = 1ull << 32;
+    uint64_t current_inc = 1ull << 16;
     // std::cout << "num_syms: " << num_syms << "\n" << std::flush;
     for (int i = 0; i < num_syms; ++i) {
       while (len_count[current_len] == current_len_count) {
@@ -517,30 +507,44 @@ class Decoder {
         len_syms_[current_len] = &syms[i];
         code_begin_[current_len] = current_code;
       }
-      assert(current_len < 32);
+      assert(current_len <= kMaxCodeLength);
 
       if (current_len <= 8) {
-        uint32_t x_begin = current_code >> 24;
-        for (uint32_t x = x_begin; x < x_begin + (current_inc >> 24); ++x) {
+        uint32_t x_begin = current_code >> 8;
+        for (uint32_t x = x_begin; x < x_begin + (current_inc >> 8); ++x) {
           assert(x < 256);
           len_begin_[x] = current_len;
           fast_sym_[x] = syms[i];
         }
       } else {
-        uint32_t x = current_code >> 24;
+        uint32_t x = current_code >> 8;
         if (len_begin_[x] == 0) {
           len_begin_[x] = current_len;
         }
       }
+      DecodedSym dsym = {syms[i], uint8_t(current_len)};
+      std::fill(dtable_.begin() + current_code,
+                dtable_.begin() + current_code + current_inc, dsym);
+
       current_code += current_inc;
       ++current_len_count;
     }
     // Should have exactly wrapped around:
-    assert(current_code == 0);
+    if (num_syms != 0) {
+      assert(current_code == (1 << 16));
+    }
   }
 
-  int Decode(uint32_t code, uint8_t* out_sym) const {
-    const int top_byte = code >> 24;
+  int Decode(uint16_t code, uint8_t* out_sym) const {
+#if 1
+    DecodedSym dsym = dtable_[code];
+    *out_sym = dsym.sym;
+    return dsym.code_len;
+#else
+    // XXX: For some reason this old code doesn't work after modifying the codes
+    // to be 16 bit.
+    code >>= 16;
+    const int top_byte = code >> 8;
     int len = len_begin_[top_byte];
 #if 1
     // This may not be any faster.
@@ -566,6 +570,7 @@ class Decoder {
 #endif
     *out_sym = sym;
     return len;
+#endif
   }
 
  private:
@@ -573,6 +578,7 @@ class Decoder {
   uint32_t code_begin_[32] = {};
   uint8_t len_begin_[256] = {};
   uint8_t fast_sym_[256] = {};
+  std::vector<DecodedSym> dtable_;
 };
 
 int CountBits(uint64_t x) { return __builtin_popcountll(x); }
@@ -591,6 +597,9 @@ std::string Compress(std::string_view raw) {
   std::string compressed;
   // TODO: Fail for too long strings.
   write_u32(compressed, raw.size());
+  if (raw.size() == 0) {
+    // SPECIAL CASE FOR EMPTY STRING:
+  }
   write_u32(compressed, coding.len_mask);
   for (uint8_t count : coding.len_count) {
     if (count != 0) {
@@ -615,7 +624,7 @@ std::string Compress(std::string_view raw) {
     BitCode b = coding.codes[*input++];
     BitCode c = coding.codes[*input++];
     // BitCode d = coding.codes[*input++];
-    writer.WriteThreeCodes(a,b,c);
+    writer.WriteThreeCodes(a, b, c);
   }
   while (input < end) {
     writer.WriteCode(coding.codes[*input++]);
@@ -645,9 +654,26 @@ std::string Decompress(std::string_view compressed) {
 
   std::string raw(raw_size, 0);
   CodeReader reader(compressed.data(), compressed.size());
-  for (size_t i = 0; i < raw_size; ++i) {
-    const uint32_t code = reader.GetTopBits();
-    int bits_read = decoder.Decode(code, reinterpret_cast<uint8_t*>(&raw[i]));
+
+  ssize_t i = 0;
+  // Three symbols at a time
+  for (; i + 2 < raw_size; i+= 3) {
+    uint64_t code = reader.GetTopBits64();
+    int a_bits =
+        decoder.Decode(code >> 48, reinterpret_cast<uint8_t*>(&raw[i]));
+    code <<= a_bits;
+    int b_bits =
+        decoder.Decode(code >> 48, reinterpret_cast<uint8_t*>(&raw[i + 1]));
+    code <<= b_bits;
+    int c_bits =
+        decoder.Decode(code >> 48, reinterpret_cast<uint8_t*>(&raw[i + 2]));
+    reader.ConsumeBits(a_bits + b_bits + c_bits);
+  }
+  // Last symbols
+  for (; i < raw_size; ++i) {
+    const uint64_t code = reader.GetTopBits64();
+    int bits_read =
+        decoder.Decode(code >> 48, reinterpret_cast<uint8_t*>(&raw[i]));
     reader.ConsumeBits(bits_read);
   }
   return raw;
@@ -810,31 +836,37 @@ std::string DecompressMulti(std::string_view compressed) {
   }
 
   std::string raw(raw_size, 0);
-  char* part_output[K];
-  part_output[0] = raw.data();
+  uint8_t* part_output[K];
+  uint8_t* part_end[K];
+  part_output[0] = reinterpret_cast<uint8_t*>(raw.data());
   for (int i = 1; i < K; ++i) {
     part_output[i] = part_output[i - 1] + sizes[i - 1];
   }
+  for (int k = 0; k < K; ++k) {
+    part_end[k] = part_output[k] + sizes[k];
+  }
 
-  for (int i = 0; i < sizes[K - 1]; ++i) {
+  while (part_output[K-1] + 2 < part_end[K-1]) {
 #pragma GCC unroll 8
     for (int k = 0; k < K; ++k) {
-      const uint32_t code = reader[k].GetTopBits();
-      uint8_t sym;
-      int bits_read = decoder.Decode(code, &sym);
-      *part_output[k] = sym;
-      ++part_output[k];
-      reader[k].ConsumeBits(bits_read);
+      uint64_t code = reader[k].GetTopBits64();
+      int a_len = decoder.Decode(code >> 48, part_output[k]++);
+      code <<= a_len;
+      int b_len = decoder.Decode(code >> 48, part_output[k]++);
+      code <<= b_len;
+      int c_len = decoder.Decode(code >> 48, part_output[k]++);
+      reader[k].ConsumeBits(a_len + b_len + c_len);
     }
   }
   // Read last symbols.
   for (int k = 0; k < K; ++k) {
-    if (sizes[k] > sizes[K - 1]) {
+    while (part_output[k] != part_end[k]) {
       const uint32_t code = reader[k].GetTopBits();
       uint8_t sym;
-      int bits_read = decoder.Decode(code, &sym);
+      int bits_read = decoder.Decode(code >> 16, &sym);
       reader[k].ConsumeBits(bits_read);
       *part_output[k] = sym;
+      ++part_output[k];
 #ifdef HUFF_DEBUG
       std::cout << "Last sym " << k << " : " << SymToStr(sym) << "\n";
 #endif
