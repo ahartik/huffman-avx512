@@ -57,16 +57,18 @@ void CountSymbols(std::string_view text, int* sym_count) {
   }
 }
 
-uint64_t ToBigEndian64(uint64_t x) { return __builtin_bswap64(x); }
-
-uint64_t FromBigEndian64(uint64_t x) { return __builtin_bswap64(x); }
-
 }  // namespace internal
    //
 
 using namespace huffman::internal;
 
 namespace {
+
+int CountBits(uint64_t x) { return __builtin_popcountll(x); }
+
+inline uint64_t ToBigEndian64(uint64_t x) { return __builtin_bswap64(x); }
+
+inline uint64_t FromBigEndian64(uint64_t x) { return __builtin_bswap64(x); }
 
 struct BitCode {
   uint16_t bits;
@@ -581,8 +583,6 @@ class Decoder {
   std::vector<DecodedSym> dtable_;
 };
 
-int CountBits(uint64_t x) { return __builtin_popcountll(x); }
-
 }  // namespace
 
 std::string Compress(std::string_view raw) {
@@ -655,25 +655,22 @@ std::string Decompress(std::string_view compressed) {
   std::string raw(raw_size, 0);
   CodeReader reader(compressed.data(), compressed.size());
 
-  ssize_t i = 0;
+  uint8_t* output = reinterpret_cast<uint8_t*>(raw.data());
+  uint8_t* output_end = output + raw_size;
   // Three symbols at a time
-  for (; i + 2 < raw_size; i+= 3) {
+  while (output + 2 < output_end) {
     uint64_t code = reader.GetTopBits64();
-    int a_bits =
-        decoder.Decode(code >> 48, reinterpret_cast<uint8_t*>(&raw[i]));
+    int a_bits = decoder.Decode(code >> 48, output++);
     code <<= a_bits;
-    int b_bits =
-        decoder.Decode(code >> 48, reinterpret_cast<uint8_t*>(&raw[i + 1]));
+    int b_bits = decoder.Decode(code >> 48, output++);
     code <<= b_bits;
-    int c_bits =
-        decoder.Decode(code >> 48, reinterpret_cast<uint8_t*>(&raw[i + 2]));
+    int c_bits = decoder.Decode(code >> 48, output++);
     reader.ConsumeBits(a_bits + b_bits + c_bits);
   }
   // Last symbols
-  for (; i < raw_size; ++i) {
+  while (output != output_end) {
     const uint64_t code = reader.GetTopBits64();
-    int bits_read =
-        decoder.Decode(code >> 48, reinterpret_cast<uint8_t*>(&raw[i]));
+    int bits_read = decoder.Decode(code >> 48, output++);
     reader.ConsumeBits(bits_read);
   }
   return raw;
