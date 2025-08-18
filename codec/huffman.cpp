@@ -170,8 +170,10 @@ uint32_t read_u32(std::string_view& in) {
   return x;
 }
 
-// Maximum code length we want to use.
-const int kMaxCodeLength = 16;
+// Maximum code length we want to use.  Shorter max code lengths makes for
+// faster compression and decompression.
+const int kMaxCodeLength = 14;
+const uint32_t kMaxCodeMask = (1 << kMaxCodeLength) - 1;
 // Maximum code length that would be optimal in terms of compression.  We use
 // shorter codes with slightly worse compression to gain better performance.
 const int kMaxOptimalCodeLength = 32;
@@ -388,7 +390,17 @@ class CodeReader {
 
   uint64_t GetFirstBits() const { return buf_bits_; }
 
+  void ConsumeFast(int num_bits) {
+    buf_len_ -= num_bits;
+    buf_bits_ >>= num_bits;
+  }
+
   void ConsumeBits(int num_bits) {
+    ConsumeFast(num_bits);
+    FillBuffer();
+  }
+
+  void FillBuffer() {
     uint64_t bytes = 0;
     if (__builtin_expect(input_ + 8 > end_, 0)) {
       int num_bytes_available = end_ - input_;
@@ -399,13 +411,13 @@ class CodeReader {
       memcpy(&bytes, input_, 8);
     }
 
-    buf_len_ -= num_bits;
-    buf_bits_ >>= num_bits;
-
     int num_bytes_to_read = (64 - buf_len_) >> 3;
     assert(buf_len_ >= 0);
     assert(num_bytes_to_read <= 8);
+    assert(num_bytes_to_read >= 0);
 
+    // This assert would be good, but fails for
+    // assert(buf_len_ < 64);
     buf_bits_ |= bytes << buf_len_;
     buf_len_ += num_bytes_to_read * 8;
     assert(buf_len_ <= 64);
@@ -424,8 +436,8 @@ class CodeReader {
 };
 
 struct DecodedSym {
-  uint8_t sym;
-  uint8_t code_len;
+  uint8_t code_len = 0;
+  uint8_t sym = 0;
 };
 
 class Decoder {
@@ -447,12 +459,13 @@ class Decoder {
         current_inc >>= 1;
       }
 
-      DecodedSym dsym = {syms[i], uint8_t(current_len)};
-      int num = 0;
+      DecodedSym dsym = {
+          .code_len = uint8_t(current_len),
+          .sym = syms[i],
+      };
       for (uint32_t code = ReverseBits16(current_code);
            code < (1 << kMaxCodeLength); code += (1 << current_len)) {
         dtable_[code] = dsym;
-        ++num;
       }
 
       current_code += current_inc;
@@ -476,6 +489,120 @@ class Decoder {
  private:
   std::vector<DecodedSym> dtable_;
 };
+
+struct TrieNode {
+  int max_len = 0;
+  uint32_t mask = 0;
+  DecodedSym* dsyms = nullptr;
+};
+
+class TrieDecoder {
+ public:
+  TrieDecoder(uint8_t* len_count, const uint8_t* syms, int num_syms)
+      : dtable_(1 << kMaxCodeLength) {
+    // Note that this code also handles the strange case where there is only 1
+    // symbol in the compressed text, in which case that symbol is encoded
+    // using 0 bits.
+    int current_len = 0;
+    int current_len_count = 0;
+    uint32_t current_code = 0;
+    uint64_t current_inc = 1ull << 16;
+    // std::cout << "num_syms: " << num_syms << "\n" << std::flush;
+    for (int i = 0; i < num_syms; ++i) {
+      const uint8_t sym = syms[i];
+      while (len_count[current_len] == current_len_count) {
+        ++current_len;
+        current_len_count = 0;
+        current_inc >>= 1;
+      }
+
+      DecodedSym dsym = {
+          .code_len = uint8_t(current_len),
+          .sym = sym,
+      };
+      dsyms_[i] = dsym;
+      // current_code is represented as first bit being the highest (position
+      // 16), but we actually use the codes the other way around.
+      const uint32_t le_code = ReverseBits16(current_code);
+      int first_byte = le_code & 0xff;
+      if (current_len <= 8) {
+        for (uint32_t byte = first_byte; byte < 256;
+             byte += (1 << current_len)) {
+          trie_[byte].max_len = current_len;
+          trie_[byte].dsyms = &dsyms_[i];
+        }
+      } else {
+        // Possibly more than one length for this 8-bit prefix.
+        // Lengths are added in increasing order.
+        trie_[first_byte].max_len = current_len;
+      }
+
+      current_code += current_inc;
+      ++current_len_count;
+    }
+
+    // Should have exactly wrapped around:
+    if (num_syms != 0) {
+      assert(current_code == (1 << 16));
+    }
+    int dtable_offset = 0;
+    // Loop again to build the second level now that we have max_len.
+    current_code = 0;
+    current_inc = 1ull << 16;
+    current_len = 0;
+    current_len_count = 0;
+    for (int i = 0; i < num_syms; ++i) {
+      const uint8_t sym = syms[i];
+      while (len_count[current_len] == current_len_count) {
+        ++current_len;
+        current_len_count = 0;
+        current_inc >>= 1;
+      }
+      const uint32_t le_code = ReverseBits16(current_code);
+      DecodedSym dsym = {
+          .code_len = uint8_t(current_len),
+          .sym = sym,
+      };
+      int byte = le_code & 0xff;
+      if (trie_[byte].max_len > 8) {
+        trie_[byte].mask = (1 << (trie_[byte].max_len - 8)) - 1;
+        // Only these long codes need the second level table.
+        if (trie_[byte].dsyms == nullptr) {
+          trie_[byte].dsyms = &dtable_[dtable_offset];
+          dtable_offset += 1 << (trie_[byte].max_len - 8);
+          assert(size_t(dtable_offset) <= dtable_.size());
+        }
+        int num = 0;
+        for (uint32_t c = le_code; c < (1u << trie_[byte].max_len);
+             c += (1 << current_len)) {
+          trie_[byte].dsyms[c >> 8] = dsym;
+          ++num;
+        }
+        // std::cout << std::format("byte {:02x}, num={} max_len={}\n", byte,
+        // num,
+        //                          trie_[byte].max_len);
+      }
+      current_code += current_inc;
+      ++current_len_count;
+    }
+  }
+
+  int Decode(uint16_t code, uint8_t* out_sym) const {
+    const TrieNode& node = trie_[code & 0xff];
+    code >>= 8;
+    code &= node.mask;
+    DecodedSym dsym = node.dsyms[code];
+    *out_sym = dsym.sym;
+    return dsym.code_len;
+  }
+
+ private:
+  std::vector<DecodedSym> dtable_;
+  DecodedSym dsyms_[256];
+  TrieNode trie_[256] = {};
+};
+
+using BestDecoder = Decoder;
 
 }  // namespace
 
@@ -542,7 +669,13 @@ std::string Decompress(std::string_view compressed) {
       num_syms += len_count[i];
     }
   }
-  Decoder decoder(
+  if (num_syms == 1) {
+    // Output consists of a single symbol only.
+    // This causes troubles in decoder, since the symbol is encoded using 0
+    // bits. We can just handle this case by itself:
+    return std::string(raw_size, compressed[0]);
+  }
+  BestDecoder decoder(
       len_count, reinterpret_cast<const uint8_t*>(compressed.data()), num_syms);
   compressed.remove_prefix(num_syms);
 
@@ -554,21 +687,21 @@ std::string Decompress(std::string_view compressed) {
 // Four symbols at a time
 #if 1
   while (output + 3 < output_end) {
-    uint64_t code = reader.GetFirstBits();
-    int a_bits = decoder.Decode(code & 0xffff, output++);
-    code >>= a_bits;
-    int b_bits = decoder.Decode(code & 0xffff, output++);
-    code >>= b_bits;
-    int c_bits = decoder.Decode(code & 0xffff, output++);
-    code >>= c_bits;
-    int d_bits = decoder.Decode(code & 0xffff, output++);
-    reader.ConsumeBits(a_bits + b_bits + c_bits + d_bits);
+    int a_bits = decoder.Decode(reader.GetFirstBits() & kMaxCodeMask, output++);
+    reader.ConsumeFast(a_bits);
+    int b_bits = decoder.Decode(reader.GetFirstBits() & kMaxCodeMask, output++);
+    reader.ConsumeFast(b_bits);
+    int c_bits = decoder.Decode(reader.GetFirstBits() & kMaxCodeMask, output++);
+    reader.ConsumeFast(c_bits);
+    int d_bits = decoder.Decode(reader.GetFirstBits() & kMaxCodeMask, output++);
+    reader.ConsumeFast(d_bits);
+    reader.FillBuffer();
   }
 #endif
   // Last symbols
   while (output != output_end) {
     const uint64_t code = reader.GetFirstBits();
-    int bits_read = decoder.Decode(code & 0xffff, output++);
+    int bits_read = decoder.Decode(code & kMaxCodeMask, output++);
     reader.ConsumeBits(bits_read);
   }
   return raw;
@@ -693,8 +826,8 @@ std::string DecompressMulti(std::string_view compressed) {
     }
   }
 
-  Decoder decoder(len_count, reinterpret_cast<const uint8_t*>(&compressed[0]),
-                  num_syms);
+  BestDecoder decoder(
+      len_count, reinterpret_cast<const uint8_t*>(&compressed[0]), num_syms);
   compressed.remove_prefix(num_syms);
 
   int end_offset[K] = {};
@@ -736,17 +869,16 @@ std::string DecompressMulti(std::string_view compressed) {
 #if 1
   while (part_output[K - 1] + 3 < part_end[K - 1]) {
 #pragma GCC unroll 8
+    for (int j = 0; j < 4; ++j) {
+#pragma GCC unroll 8
+      for (int k = 0; k < K; ++k) {
+        int code_len = decoder.Decode(reader[k].GetFirstBits() & kMaxCodeMask,
+                                      part_output[k]++);
+        reader[k].ConsumeFast(code_len);
+      }
+    }
     for (int k = 0; k < K; ++k) {
-      uint64_t code = reader[k].GetFirstBits();
-      int a_bits = decoder.Decode(code & 0xffff, part_output[k]++);
-      code >>= a_bits;
-      int b_bits = decoder.Decode(code & 0xffff, part_output[k]++);
-      code >>= b_bits;
-      int c_bits = decoder.Decode(code & 0xffff, part_output[k]++);
-      code >>= c_bits;
-      int d_bits = decoder.Decode(code & 0xffff, part_output[k]++);
-      reader[k].ConsumeBits(a_bits + b_bits + c_bits + d_bits);
-      // reader[k].ConsumeBits(a_bits + b_bits + c_bits);
+      reader[k].FillBuffer();
     }
   }
 #endif
@@ -754,10 +886,11 @@ std::string DecompressMulti(std::string_view compressed) {
   for (int k = 0; k < K; ++k) {
     while (part_output[k] != part_end[k]) {
       const uint64_t code = reader[k].GetFirstBits();
-      int bits_read = decoder.Decode(code & 0xffff, part_output[k]++);
+      int bits_read = decoder.Decode(code & kMaxCodeMask, part_output[k]++);
       reader[k].ConsumeBits(bits_read);
 #ifdef HUFF_DEBUG
-      std::cout << "Last sym " << k << " : " << SymToStr(*(part_output[k]-1)) << "\n";
+      std::cout << "Last sym " << k << " : " << SymToStr(*(part_output[k] - 1))
+                << "\n";
 #endif
     }
   }
