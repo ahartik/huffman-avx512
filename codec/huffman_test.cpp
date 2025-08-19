@@ -101,6 +101,7 @@ TYPED_TEST(CompressorTest, ManyRandom) {
       do {
         // Make a biased distribution
         ch = (rand() & rand() & rand()) & 0xff;
+        ch ^= 'A';
       } while (!std::isprint(ch));
       raw.push_back(ch);
     }

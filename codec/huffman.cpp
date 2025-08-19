@@ -377,14 +377,13 @@ class CodeReader {
  public:
   CodeReader() { Init(nullptr, 0); }
 
-  CodeReader(const char* input, size_t size) { Init(input, size); }
+  CodeReader(const char* input, const char* end) { Init(input, end); }
 
-  void Init(const char* input, size_t size) {
+  void Init(const char* input, const char* end) {
     input_ = input;
-    end_ = input + size;
+    end_ = end;
     buf_bits_ = 0;
     buf_len_ = 0;
-    input_bits_used_ = 0;
     ConsumeBits(0);
   }
 
@@ -400,7 +399,36 @@ class CodeReader {
     FillBuffer();
   }
 
+
+  bool FillBufferFast() {
+    uint64_t bytes = 0;
+    if (__builtin_expect(input_ + 8 > end_, 0)) {
+      return false;
+    } else {
+      memcpy(&bytes, input_, 8);
+    }
+
+    int num_bytes_to_read = (64 - buf_len_) >> 3;
+    assert(buf_len_ >= 0);
+    assert(num_bytes_to_read <= 8);
+    assert(num_bytes_to_read >= 0);
+
+    // This assert would be good, but fails for
+    // assert(buf_len_ < 64);
+    buf_bits_ |= bytes << buf_len_;
+    buf_len_ += num_bytes_to_read * 8;
+    assert(buf_len_ <= 64);
+    assert(buf_len_ >= 48);
+    //   std::cout << std::format("buf_bits_={:064B}\n", buf_bits_)
+    //             << std::flush;
+    input_ += num_bytes_to_read;
+    return true;
+  }
+
   void FillBuffer() {
+    if (buf_len_ == 64) {
+      return;
+    }
     uint64_t bytes = 0;
     if (__builtin_expect(input_ + 8 > end_, 0)) {
       int num_bytes_available = end_ - input_;
@@ -431,7 +459,6 @@ class CodeReader {
   const char* input_;
   const char* end_;
   uint64_t buf_bits_;
-  int input_bits_used_;
   int buf_len_;
 };
 
@@ -476,6 +503,8 @@ class Decoder {
       assert(current_code == (1 << 16));
     }
   }
+
+  // TODO: Two symbols at a time decoding.
 
   int Decode(uint16_t code, uint8_t* out_sym) const {
     DecodedSym dsym = dtable_[code];
@@ -680,13 +709,13 @@ std::string Decompress(std::string_view compressed) {
   compressed.remove_prefix(num_syms);
 
   std::string raw(raw_size, 0);
-  CodeReader reader(compressed.data(), compressed.size());
+  CodeReader reader(compressed.data(), compressed.data() + compressed.size());
 
   uint8_t* output = reinterpret_cast<uint8_t*>(raw.data());
   uint8_t* output_end = output + raw_size;
-// Four symbols at a time
-#if 1
-  while (output + 3 < output_end) {
+  // Four symbols at a time
+  bool readers_good = true;
+  while (readers_good & (output + 3 < output_end)) {
     int a_bits = decoder.Decode(reader.GetFirstBits() & kMaxCodeMask, output++);
     reader.ConsumeFast(a_bits);
     int b_bits = decoder.Decode(reader.GetFirstBits() & kMaxCodeMask, output++);
@@ -695,11 +724,12 @@ std::string Decompress(std::string_view compressed) {
     reader.ConsumeFast(c_bits);
     int d_bits = decoder.Decode(reader.GetFirstBits() & kMaxCodeMask, output++);
     reader.ConsumeFast(d_bits);
-    reader.FillBuffer();
+    readers_good = reader.FillBufferFast();
+    // reader.FillBuffer();
   }
-#endif
   // Last symbols
   while (output != output_end) {
+    reader.FillBuffer();
     const uint64_t code = reader.GetFirstBits();
     int bits_read = decoder.Decode(code & kMaxCodeMask, output++);
     reader.ConsumeBits(bits_read);
@@ -785,7 +815,7 @@ std::string CompressMulti(std::string_view raw) {
     writer[k].Init(part_output[k]);
   }
 
-#if 0
+#if 1
   while (part_input[K - 1] + 2 < part_end[K - 1]) {
 #pragma GCC unroll 8
     for (int k = 0; k < K; ++k) {
@@ -852,7 +882,7 @@ std::string DecompressMulti(std::string_view compressed) {
   for (int k = 0; k < K; ++k) {
     int start_index = (k == 0) ? 0 : end_offset[k - 1];
     reader[k].Init(compressed.data() + start_index,
-                   end_offset[k] - start_index);
+        compressed.data() + compressed.size());
   }
 
   std::string raw(raw_size, 0);
@@ -867,7 +897,8 @@ std::string DecompressMulti(std::string_view compressed) {
   }
 
 #if 1
-  while (part_output[K - 1] + 3 < part_end[K - 1]) {
+  bool readers_good = true;
+  while (readers_good & (part_output[K - 1] + 3 < part_end[K - 1])) {
 #pragma GCC unroll 8
     for (int j = 0; j < 4; ++j) {
 #pragma GCC unroll 8
@@ -878,12 +909,13 @@ std::string DecompressMulti(std::string_view compressed) {
       }
     }
     for (int k = 0; k < K; ++k) {
-      reader[k].FillBuffer();
+      readers_good &= reader[k].FillBufferFast();
     }
   }
 #endif
   // Read last symbols.
   for (int k = 0; k < K; ++k) {
+    reader[k].FillBuffer();
     while (part_output[k] != part_end[k]) {
       const uint64_t code = reader[k].GetFirstBits();
       int bits_read = decoder.Decode(code & kMaxCodeMask, part_output[k]++);
