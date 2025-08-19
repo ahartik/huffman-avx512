@@ -5,8 +5,6 @@
 #include <format>
 #include <string_view>
 
-using ByteCounts = std::array<int, 256>;
-
 namespace huffman {
 
 std::string Compress(std::string_view raw);

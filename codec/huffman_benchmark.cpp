@@ -1,4 +1,5 @@
 #include "codec/huffman.h"
+#include "codec/huff0.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -137,6 +138,9 @@ void BM_DecompressLong(benchmark::State& state) {
     std::string decompressed = Compressor::Decompress(compressed);
   }
   state.SetBytesProcessed(state.iterations() * len);
+
+  double ratio = double(compressed.size()) / raw.size();
+  state.counters["ratio"] = ratio;
 }
 }  // namespace
 
@@ -153,3 +157,5 @@ void BM_DecompressLong(benchmark::State& state) {
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressor)
 // DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<2>)
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<4>)
+
+DEFINE_BENCHMARKS(::huffman::Huff0Compressor)

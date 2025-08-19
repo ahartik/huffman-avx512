@@ -1,4 +1,5 @@
 #include "codec/huffman.h"
+#include "codec/huff0.h"
 
 #include <cstdlib>
 #include <cstdio>
@@ -24,8 +25,8 @@ class NameGenerator {
 };
 
 using Compressors = ::testing::Types<huffman::HuffmanCompressor,
-      huffman::HuffmanCompressorMulti<2>,
-      huffman::HuffmanCompressorMulti<4>
+      huffman::HuffmanCompressorMulti<4>,
+      huffman::Huff0Compressor
       >;
 TYPED_TEST_SUITE(CompressorTest, Compressors, NameGenerator);
 
