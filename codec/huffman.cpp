@@ -383,15 +383,16 @@ class CodeReader {
     input_ = input;
     end_ = end;
     buf_bits_ = 0;
-    buf_len_ = 0;
-    ConsumeBits(0);
+    bits_used_ = 0;
+    FillBuffer();
   }
 
-  uint64_t GetFirstBits() const { return buf_bits_; }
+  uint64_t GetFirstBits() const {
+    return buf_bits_ >> bits_used_;
+  }
 
   void ConsumeFast(int num_bits) {
-    buf_len_ -= num_bits;
-    buf_bits_ >>= num_bits;
+    bits_used_ += num_bits;
   }
 
   void ConsumeBits(int num_bits) {
@@ -399,67 +400,35 @@ class CodeReader {
     FillBuffer();
   }
 
-
-  bool FillBufferFast() {
-    uint64_t bytes = 0;
-    if (__builtin_expect(input_ + 8 > end_, 0)) {
-      return false;
-    } else {
-      memcpy(&bytes, input_, 8);
-    }
-
-    int num_bytes_to_read = (64 - buf_len_) >> 3;
-    assert(buf_len_ >= 0);
-    assert(num_bytes_to_read <= 8);
-    assert(num_bytes_to_read >= 0);
-
-    // This assert would be good, but fails for
-    // assert(buf_len_ < 64);
-    buf_bits_ |= bytes << buf_len_;
-    buf_len_ += num_bytes_to_read * 8;
-    assert(buf_len_ <= 64);
-    assert(buf_len_ >= 48);
-    //   std::cout << std::format("buf_bits_={:064B}\n", buf_bits_)
-    //             << std::flush;
-    input_ += num_bytes_to_read;
-    return true;
-  }
-
   void FillBuffer() {
-    if (buf_len_ == 64) {
-      return;
-    }
-    uint64_t bytes = 0;
+    input_ += (bits_used_ >> 3);
+    bits_used_ &= 7;
     if (__builtin_expect(input_ + 8 > end_, 0)) {
       int num_bytes_available = end_ - input_;
       if (num_bytes_available > 0) {
-        memcpy(&bytes, input_, num_bytes_available);
+        memcpy(&buf_bits_, input_, num_bytes_available);
       }
     } else {
-      memcpy(&bytes, input_, 8);
+      memcpy(&buf_bits_, input_, 8);
     }
+  }
 
-    int num_bytes_to_read = (64 - buf_len_) >> 3;
-    assert(buf_len_ >= 0);
-    assert(num_bytes_to_read <= 8);
-    assert(num_bytes_to_read >= 0);
-
-    // This assert would be good, but fails for
-    // assert(buf_len_ < 64);
-    buf_bits_ |= bytes << buf_len_;
-    buf_len_ += num_bytes_to_read * 8;
-    assert(buf_len_ <= 64);
-    assert(buf_len_ >= 48);
-    //   std::cout << std::format("buf_bits_={:064B}\n", buf_bits_)
-    //             << std::flush;
-    input_ += num_bytes_to_read;
+  bool FillBufferFast() {
+    input_ += (bits_used_ >> 3);
+    bits_used_ &= 7;
+    if (__builtin_expect(input_ + 8 > end_, 0)) {
+      return false;
+    } else {
+      memcpy(&buf_bits_, input_, 8);
+    }
+    return true;
   }
 
  private:
   const char* input_;
   const char* end_;
   uint64_t buf_bits_;
-  int buf_len_;
+  int bits_used_;
 };
 
 struct DecodedSym {
@@ -508,11 +477,12 @@ class Decoder {
 
   int Decode(uint16_t code, uint8_t* out_sym) const {
     DecodedSym dsym = dtable_[code];
+    const int len = dsym.code_len;
     *out_sym = dsym.sym;
     //     std::cout << std::format("Decode: {:016B} -> {}, {}\n", code,
     //     dsym.sym,
     //                              dsym.code_len);
-    return dsym.code_len;
+    return len;
   }
 
  private:
@@ -908,8 +878,10 @@ std::string DecompressMulti(std::string_view compressed) {
         reader[k].ConsumeFast(code_len);
       }
     }
+#pragma GCC unroll 8
     for (int k = 0; k < K; ++k) {
       readers_good &= reader[k].FillBufferFast();
+      // reader[k].FillBuffer();
     }
   }
 #endif
