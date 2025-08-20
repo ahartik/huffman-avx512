@@ -172,7 +172,7 @@ uint32_t read_u32(std::string_view& in) {
 
 // Maximum code length we want to use.  Shorter max code lengths makes for
 // faster compression and decompression.
-const int kMaxCodeLength = 14;
+const int kMaxCodeLength = 12;
 const uint32_t kMaxCodeMask = (1 << kMaxCodeLength) - 1;
 // Maximum code length that would be optimal in terms of compression.  We use
 // shorter codes with slightly worse compression to gain better performance.
@@ -212,18 +212,16 @@ void LimitCodeLengths(uint8_t* len_count) {
   std::cout << "kraft_total: " << kraft_total << " one: " << one << "\n";
   std::cout << std::flush;
 #endif
-  int second_longest_len = kMaxCodeLength - 1;
+  // int second_longest_len = kMaxCodeLength - 1;
   while (kraft_total > one) {
     // Decrease the length of one code with the maximum length.
     --len_count[kMaxCodeLength];
     // Increase the length for some code with currently a shorter length.
-    while (second_longest_len > 0) {
-      if (len_count[second_longest_len] > 0) {
-        --len_count[second_longest_len];
-        len_count[second_longest_len + 1] += 2;
+    for (int j = kMaxCodeLength-1; j >= 0; --j) {
+      if (len_count[j] > 0) {
+        --len_count[j];
+        len_count[j + 1] += 2;
         break;
-      } else {
-        --second_longest_len;
       }
     }
     --kraft_total;
