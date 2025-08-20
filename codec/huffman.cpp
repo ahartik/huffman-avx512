@@ -1,6 +1,9 @@
 #include "codec/huffman.h"
 
 #include <arpa/inet.h>
+#include <immintrin.h>
+#include <x86intrin.h>
+
 #include <ctype.h>
 #include <cassert>
 #include <cstdint>
@@ -12,8 +15,7 @@
 #include <iostream>
 #include <memory>
 #include <vector>
-
-#include "x86intrin.h"
+#include <sstream>
 
 namespace huffman {
 
@@ -172,7 +174,7 @@ uint32_t read_u32(std::string_view& in) {
 
 // Maximum code length we want to use.  Shorter max code lengths makes for
 // faster compression and decompression.
-const int kMaxCodeLength = 12;
+const int kMaxCodeLength = 13;
 const uint32_t kMaxCodeMask = (1 << kMaxCodeLength) - 1;
 // Maximum code length that would be optimal in terms of compression.  We use
 // shorter codes with slightly worse compression to gain better performance.
@@ -191,10 +193,6 @@ struct CanonicalCoding {
 // This uses the "MiniZ" method as described in
 // https://create.stephan-brumme.com/length-limited-prefix-codes/#miniz
 void LimitCodeLengths(uint8_t* len_count) {
-  // Tweak code lens to reduce max length.
-  // This uses the "MiniZ" method as described in
-  // https://create.stephan-brumme.com/length-limited-prefix-codes/#miniz
-
   bool adjustment_required = 0;
   for (int i = kMaxCodeLength + 1; i <= kMaxOptimalCodeLength; ++i) {
     adjustment_required |= len_count[i] > 0;
@@ -217,7 +215,7 @@ void LimitCodeLengths(uint8_t* len_count) {
     // Decrease the length of one code with the maximum length.
     --len_count[kMaxCodeLength];
     // Increase the length for some code with currently a shorter length.
-    for (int j = kMaxCodeLength-1; j >= 0; --j) {
+    for (int j = kMaxCodeLength - 1; j >= 0; --j) {
       if (len_count[j] > 0) {
         --len_count[j];
         len_count[j + 1] += 2;
@@ -385,13 +383,9 @@ class CodeReader {
     FillBuffer();
   }
 
-  uint64_t GetFirstBits() const {
-    return buf_bits_ >> bits_used_;
-  }
+  uint64_t GetFirstBits() const { return buf_bits_ >> bits_used_; }
 
-  void ConsumeFast(int num_bits) {
-    bits_used_ += num_bits;
-  }
+  void ConsumeFast(int num_bits) { bits_used_ += num_bits; }
 
   void ConsumeBits(int num_bits) {
     ConsumeFast(num_bits);
@@ -437,7 +431,7 @@ struct DecodedSym {
 class Decoder {
  public:
   Decoder(uint8_t* len_count, const uint8_t* syms, int num_syms)
-      : dtable_(1 << kMaxCodeLength) {
+      : dtable_((1 << kMaxCodeLength) + 4) {
     // Note that this code also handles the strange case where there is only 1
     // symbol in the compressed text, in which case that symbol is encoded
     // using 0 bits.
@@ -482,6 +476,8 @@ class Decoder {
     //                              dsym.code_len);
     return len;
   }
+
+  const DecodedSym* dtable() const { return dtable_.data(); }
 
  private:
   std::vector<DecodedSym> dtable_;
@@ -850,7 +846,7 @@ std::string DecompressMulti(std::string_view compressed) {
   for (int k = 0; k < K; ++k) {
     int start_index = (k == 0) ? 0 : end_offset[k - 1];
     reader[k].Init(compressed.data() + start_index,
-        compressed.data() + compressed.size());
+                   compressed.data() + compressed.size());
   }
 
   std::string raw(raw_size, 0);
@@ -900,11 +896,174 @@ std::string DecompressMulti(std::string_view compressed) {
   return raw;
 }
 
+std::string Int64VecToString(__m512i vec) {
+  int64_t nums[8];
+  _mm512_storeu_epi64(nums, vec);
+  std::ostringstream s;
+  s << "[";
+  for (int i = 0; i < 8; ++i) {
+    s << nums[i];
+    if (i != 7) {
+      s << ", ";
+    }
+  }
+  s << "]";
+  return s.str();
+}
+
+std::string DecompressMulti8Avx512(std::string_view compressed) {
+  constexpr int K = 8;
+  const uint32_t raw_size = read_u32(compressed);
+  const uint32_t len_mask = read_u32(compressed);
+  uint8_t len_count[32] = {};
+  int num_syms = 0;
+  for (int i = 0; i < 32; ++i) {
+    if (len_mask & (1 << i)) {
+      len_count[i] = uint8_t(compressed[0]);
+      compressed.remove_prefix(1);
+      num_syms += len_count[i];
+    }
+  }
+
+  Decoder decoder(len_count, reinterpret_cast<const uint8_t*>(&compressed[0]),
+                  num_syms);
+  compressed.remove_prefix(num_syms);
+
+  uint64_t end_offset[K] = {};
+  for (int k = 0; k < K - 1; ++k) {
+    end_offset[k] = read_u32(compressed);
+  }
+  end_offset[K - 1] = compressed.size();
+
+  int sizes[K] = {};
+  for (int i = 0; i < K; ++i) {
+    sizes[i] = raw_size / K;
+  }
+  for (size_t i = 0; i < raw_size % K; ++i) {
+    ++sizes[i];
+  }
+  std::string raw(raw_size, 0);
+  const uint8_t* const read_base =
+      reinterpret_cast<const uint8_t*>(compressed.data());
+  uint8_t* const write_base = 
+    reinterpret_cast<uint8_t*>(raw.data());
+  const void* const dtable_base = decoder.dtable();
+
+  uint64_t read_offset[K] = {};
+  for (int k = 1; k < K; ++k) {
+    read_offset[k] = end_offset[k - 1];
+  }
+  uint64_t write_offset[K] = {};
+  for (int k = 1; k < K; ++k) {
+    write_offset[k] = write_offset[k - 1] + sizes[k - 1];
+  }
+
+  uint64_t write_end[K] = {};
+  for (int k = 0; k < K; ++k) {
+    write_end[k] = write_offset[k] + sizes[k];
+  }
+
+  // 8 indices for reading data
+  __m512i read_index = _mm512_loadu_epi64(read_offset);
+  __m512i write_index = _mm512_loadu_epi64(write_offset);
+  const __m512i end_offset_vec = _mm512_loadu_epi64(end_offset);
+
+  const __m512i read_limit =
+      _mm512_sub_epi64(end_offset_vec, _mm512_set1_epi64(7));
+  const __m512i write_limit =
+      _mm512_sub_epi64(_mm512_loadu_epi64(write_end), _mm512_set1_epi64(3));
+
+  // 8 integers for how many bits of the current word are already consumed.
+  __m512i bits_consumed = _mm512_setzero_si512();
+  const __m512i table_mask = _mm512_set1_epi64((1 << kMaxCodeLength) - 1);
+
+  // Each iteration decodes 4 bytes
+  while (true) {
+    // std::cout << "AVX ITER\n" << std::flush;
+    // Check that we can continue:
+    __mmask8 write_bad = _mm512_cmpge_epi64_mask(write_index, write_limit);
+    __mmask8 read_bad = _mm512_cmpge_epi64_mask(read_index, read_limit);
+    __mmask8 some_bad = _kor_mask8(write_bad, read_bad);
+    if (_cvtmask8_u32(some_bad) != 0) {
+      // TODO: This testing thing is weird, investigate if it can be optimized.
+      break;
+    }
+
+    // Skip forward:
+    // bytes_consumed = bits_consumed / 8;
+    __m512i bytes_consumed = _mm512_srli_epi64(bits_consumed, 3);
+    read_index = _mm512_add_epi64(read_index, bytes_consumed);
+    // Remainder bits: bits_consumed = bits_consumed % 8;
+    bits_consumed = _mm512_and_epi64(bits_consumed, _mm512_set1_epi64(7));
+
+    // Read the bits to decompress
+    __m512i bits = _mm512_i64gather_epi64(read_index, read_base, 1);
+    // Shift used bits away
+    bits = _mm512_srlv_epi64(bits, bits_consumed);
+
+    __m512i syms = _mm512_setzero_si512();
+    // Second byte:
+#pragma GCC unroll 8
+    for (int j = 0; j < 4; ++j) {
+      __m512i index = _mm512_and_epi64(bits, table_mask);
+      // Table has two bytes for each entry. We read 64 bits for each entry
+      // due to two reasons:
+      // 1. There is no instruction to "gather" only 2 bytes
+      // 2. Keeping vector size at 512 bits is faster since no conversions are
+      // required.
+      __m512i dsyms = _mm512_i64gather_epi64(index, dtable_base, 2);
+      // Now, code length is stored in the lowest byte of each 64-bit word, and
+      // the symbol in the second-lowest byte.
+
+      __m512i this_sym = _mm512_and_epi64(_mm512_srli_epi64(dsyms, 8),
+                                          _mm512_set1_epi64(0xff));
+      syms = _mm512_or_epi64(syms, _mm512_slli_epi64(this_sym, j * 8));
+      __m512i code_len = _mm512_and_epi64(dsyms, _mm512_set1_epi64(0xff));
+      // Consume bits
+      bits = _mm512_srlv_epi64(bits, code_len);
+      bits_consumed = _mm512_add_epi64(bits_consumed, code_len);
+    }
+    // Perform write:
+    __m256i syms256 = _mm512_cvtepi64_epi32(syms);
+    _mm512_i64scatter_epi32(write_base, write_index, syms256, 1);
+    write_index = _mm512_add_epi64(write_index, _mm512_set1_epi64(4));
+  }
+  // Read the rest using scalar code. This means we need to convert the
+  // vectorized state to more regular C++ variables.
+  uint64_t bit_offset[K];
+  _mm512_storeu_epi64(write_offset, write_index);
+  _mm512_storeu_epi64(read_offset, read_index);
+  _mm512_storeu_epi64(bit_offset, bits_consumed);
+
+  // Decode 1 byte at a time:
+  for (int k = 0; k < K; ++k) {
+    for (int offset = write_offset[k]; offset < write_end[k]; ++offset) {
+      read_offset[k] += bit_offset[k] / 8;
+      bit_offset[k] %= 8;
+
+      uint64_t bits = 0;
+      const int bytes_remaining = end_offset[k] - read_offset[k];
+      if (bytes_remaining >= 8) {
+        memcpy(&bits, compressed.data() + read_offset[k], 8);
+      } else if (bytes_remaining > 0) {
+        memcpy(&bits, compressed.data() + read_offset[k], bytes_remaining);
+      }
+      bits >>= bit_offset[k];
+      bit_offset[k] += decoder.Decode(bits & kMaxCodeMask, write_base + offset);
+    }
+  }
+
+  return raw;
+}
+
 template std::string CompressMulti<2>(std::string_view compressed);
 template std::string DecompressMulti<2>(std::string_view compressed);
 template std::string CompressMulti<3>(std::string_view compressed);
 template std::string DecompressMulti<3>(std::string_view compressed);
 template std::string CompressMulti<4>(std::string_view compressed);
 template std::string DecompressMulti<4>(std::string_view compressed);
+
+template std::string CompressMulti<8>(std::string_view compressed);
+template std::string DecompressMulti<8>(std::string_view compressed);
 
 }  // namespace huffman

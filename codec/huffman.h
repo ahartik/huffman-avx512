@@ -15,6 +15,9 @@ std::string CompressMulti(std::string_view raw);
 template <int K>
 std::string DecompressMulti(std::string_view compressed);
 
+
+std::string DecompressMulti8Avx512(std::string_view compressed);
+
 class HuffmanCompressor {
  public:
   static std::string Compress(std::string_view raw) {
@@ -39,6 +42,19 @@ class HuffmanCompressorMulti {
   }
   static std::string name() {
     return std::format("HuffmanMulti<{}>", K);
+  }
+};
+
+class HuffmanCompressorAvx {
+ public:
+  static std::string Compress(std::string_view raw) {
+    return CompressMulti<8>(raw);
+  }
+  static std::string Decompress(std::string_view compressed) {
+    return DecompressMulti8Avx512(compressed);
+  }
+  static std::string name() {
+    return "HuffmanAvx";
   }
 };
 

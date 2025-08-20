@@ -26,6 +26,8 @@ class NameGenerator {
 
 using Compressors = ::testing::Types<huffman::HuffmanCompressor,
       huffman::HuffmanCompressorMulti<4>,
+      huffman::HuffmanCompressorMulti<8>,
+      huffman::HuffmanCompressorAvx,
       huffman::Huff0Compressor
       >;
 TYPED_TEST_SUITE(CompressorTest, Compressors, NameGenerator);
@@ -67,6 +69,11 @@ TYPED_TEST(CompressorTest, SingleSymbolOnly) {
   string compressed = TypeParam::Compress("AAA");
   string decompressed = TypeParam::Decompress(compressed);
   EXPECT_EQ("AAA", decompressed);
+
+  const string long_a(1000, 'a');
+  compressed = TypeParam::Compress(long_a);
+  decompressed = TypeParam::Decompress(compressed);
+  EXPECT_EQ(long_a, decompressed);
 }
 
 TYPED_TEST(CompressorTest, LongCodes) {
