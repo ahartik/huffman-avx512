@@ -911,6 +911,28 @@ std::string Int64VecToString(__m512i vec) {
   return s.str();
 }
 
+// Slowish method for decoding a single stream. Used to finish off decoding one
+// character at a time.
+void DecodeSingleStream(const Decoder& decoder, const uint8_t* compressed_begin,
+                        const uint8_t* compressed_end, int bit_offset,
+                        uint8_t* out_begin, uint8_t* out_end) {
+  const uint8_t* read_ptr = compressed_begin;
+  for (uint8_t* output = out_begin; output != out_end; ++output) {
+    read_ptr += bit_offset / 8;
+    bit_offset %= 8;
+
+    uint64_t bits = 0;
+    const int bytes_remaining = compressed_end - read_ptr;
+    if (bytes_remaining >= 8) {
+      memcpy(&bits, read_ptr, 8);
+    } else if (bytes_remaining > 0) {
+      memcpy(&bits, read_ptr, bytes_remaining);
+    }
+    bits >>= bit_offset;
+    bit_offset += decoder.Decode(bits & kMaxCodeMask, output);
+  }
+}
+
 std::string DecompressMulti8Avx512(std::string_view compressed) {
   constexpr int K = 8;
   const uint32_t raw_size = read_u32(compressed);
@@ -1002,7 +1024,6 @@ std::string DecompressMulti8Avx512(std::string_view compressed) {
     bits = _mm512_srlv_epi64(bits, bits_consumed);
 
     __m512i syms = _mm512_setzero_si512();
-    // Second byte:
 #pragma GCC unroll 8
     for (int j = 0; j < 4; ++j) {
       __m512i index = _mm512_and_epi64(bits, table_mask);
@@ -1037,22 +1058,15 @@ std::string DecompressMulti8Avx512(std::string_view compressed) {
 
   // Decode 1 byte at a time:
   for (int k = 0; k < K; ++k) {
-    for (int offset = write_offset[k]; offset < write_end[k]; ++offset) {
-      read_offset[k] += bit_offset[k] / 8;
-      bit_offset[k] %= 8;
-
-      uint64_t bits = 0;
-      const int bytes_remaining = end_offset[k] - read_offset[k];
-      if (bytes_remaining >= 8) {
-        memcpy(&bits, compressed.data() + read_offset[k], 8);
-      } else if (bytes_remaining > 0) {
-        memcpy(&bits, compressed.data() + read_offset[k], bytes_remaining);
-      }
-      bits >>= bit_offset[k];
-      bit_offset[k] += decoder.Decode(bits & kMaxCodeMask, write_base + offset);
-    }
+    DecodeSingleStream(
+        decoder,
+        read_base + read_offset[k],
+        read_base + end_offset[k],
+        bit_offset[k],
+        write_base + write_offset[k],
+        write_base + write_end[k]
+        );
   }
-
   return raw;
 }
 
