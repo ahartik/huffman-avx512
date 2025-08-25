@@ -410,14 +410,14 @@ class CodeReader {
   }
 
   void FillBuffer() {
-    DLOG(1) << "FillBuffer(): bits_used_ = " << bits_used_ << "\n";
+    DLOG(2) << "FillBuffer(): bits_used_ = " << bits_used_ << "\n";
     input_ -= bits_used_ >> 3;
     bits_used_ &= 7;
     if (__builtin_expect(input_ < begin_, 0)) {
       // Less than 8 bytes remaining, we simulate a read where the lower
       // address bytes are zero.
       int num_bytes_available = 8 - (begin_ - input_);
-      DLOG(1) << "num_bytes_available = " << num_bytes_available << "\n";
+      DLOG(2) << "num_bytes_available = " << num_bytes_available << "\n";
       buf_bits_ = 0;
       if (num_bytes_available > 0) {
         memcpy(&buf_bits_, begin_, 8);
@@ -426,14 +426,14 @@ class CodeReader {
     } else {
       memcpy(&buf_bits_, input_, 8);
     }
-    DLOG(1) << "after FillBuffer(): \n";
-    DLOG(1) << std::format("buf_bits_: {:064B} bits_used_: {}\n", buf_bits_,
+    DLOG(2) << "after FillBuffer(): \n";
+    DLOG(2) << std::format("buf_bits_: {:064B} bits_used_: {}\n", buf_bits_,
                            bits_used_);
   }
 
   // Returns false if FillBuffer() should be used instead.
   bool FillBufferFast(bool skip_compare = false) {
-    DLOG(1) << "FillBufferFast(): bits_used_ = " << bits_used_ << "\n";
+    DLOG(2) << "FillBufferFast(): bits_used_ = " << bits_used_ << "\n";
     input_ -= bits_used_ >> 3;
     bits_used_ &= 7;
     if (!skip_compare && __builtin_expect(input_ < begin_, 0)) {
@@ -441,8 +441,8 @@ class CodeReader {
     } else {
       memcpy(&buf_bits_, input_, 8);
     }
-    DLOG(1) << "after FillBufferFast(): \n";
-    DLOG(1) << std::format("buf_bits_: {:064B} bits_used_: {}\n", buf_bits_,
+    DLOG(2) << "after FillBufferFast(): \n";
+    DLOG(2) << std::format("buf_bits_: {:064B} bits_used_: {}\n", buf_bits_,
                            bits_used_);
     return true;
   }
@@ -497,7 +497,7 @@ class Decoder {
     }
     for (int j = current_len; j <= 16; ++j) max_code_for_len_[j] = current_code;
 
-    for (int j = 0; j <= 16; ++j) {
+    for (int j = 0; j < 16; ++j) {
       max_code_for_len_[j] -= 1;
     }
     // Should have exactly wrapped around:
@@ -512,22 +512,24 @@ class Decoder {
 
   inline int Decode(uint16_t code, uint8_t* out_sym,
                     bool try_avx = false) const {
-    DLOG(1) << std::format("Decode({:016B}) \n", code);
+    DLOG(2) << std::format("Decode({:016B}) \n", code);
     DecodedSym dsym = dtable_[code];
-    __m256i c_vec = _mm256_set1_epi16(code);
 
     *out_sym = dsym.sym;
-    int len = 0;
     if (try_avx) {
+      // This is slow and should likely be removed.
+      // Kept here just in case we want to try this idea in AVX512 code in the
+      // future.
+      __m256i c_vec = _mm256_set1_epi16(code);
       // This limits code length to max 15 bits, since comparison is signed.
       __m256i gt_max = _mm256_cmpgt_epi16(c_vec, max_code_vec_);
       // Now, length is the same as the count of 0xffff words in `gt_max`.
       uint32_t gt_mask = _mm256_movemask_epi8(gt_max);
       const int len = (CountBits(gt_mask) / 2);
       if (HUFF_VLOG > 0 && len != dsym.code_len) {
-        DLOG(1) << "AVX FAIL: len=" << len
+        DLOG(2) << "AVX FAIL: len=" << len
                 << " while dsym.code_len=" << int(dsym.code_len) << "\n";
-        DLOG(1) << std::format("gt_mask = {:016B}\n", gt_mask) << std::flush;
+        DLOG(2) << std::format("gt_mask = {:016B}\n", gt_mask) << std::flush;
         assert(false);
       }
       return len;
@@ -895,7 +897,9 @@ void DecodeSingleStream(const Decoder& decoder, const uint8_t* compressed_begin,
 }
 
 std::string DecompressMulti8Avx512(std::string_view compressed) {
-  constexpr int K = 8;
+  // TODO: this 
+  // constexpr int M = 1; // Superscalar parallelism
+  constexpr int K = 8; // SIMD parallelism
   const uint32_t raw_size = read_u32(compressed);
   const uint32_t len_mask = read_u32(compressed);
   uint8_t len_count[32] = {};
