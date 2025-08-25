@@ -183,7 +183,6 @@ uint32_t read_u32(std::string_view& in) {
   return x;
 }
 
-
 struct CanonicalCoding {
   int sym_count[256] = {};
   BitCode codes[256] = {};
@@ -380,14 +379,13 @@ class CodeReader {
  public:
   // After default construction, the object is not safe to use, but is safe to
   // destruct.
-  CodeReader() { 
-  }
+  CodeReader() {}
 
   CodeReader(const char* begin, const char* end) { Init(begin, end); }
 
   void Init(const char* begin, const char* end) {
-    DLOG(1) << "CodeReader::Init(" << intptr_t(end-begin) << ")\n"
-      << std::flush;
+    DLOG(1) << "CodeReader::Init(" << intptr_t(end - begin) << ")\n"
+            << std::flush;
     assert((end == nullptr) || (begin + 8 <= end));
     begin_ = begin;
     input_ = end - 8;
@@ -399,7 +397,8 @@ class CodeReader {
 
   uint16_t code() const {
     assert(64 - bits_used_ >= kMaxCodeLength);
-    // return (buf_bits_ >> (64ll - kMaxCodeLength - bits_used_)) & kMaxCodeMask;
+    // return (buf_bits_ >> (64ll - kMaxCodeLength - bits_used_)) &
+    // kMaxCodeMask;
     return (buf_bits_ << bits_used_) >> (64ll - kMaxCodeLength);
   }
 
@@ -448,9 +447,7 @@ class CodeReader {
     return true;
   }
 
-  bool is_fast() const {
-    return input_ >= begin_;
-  }
+  bool is_fast() const { return input_ >= begin_; }
 
  private:
   const char* input_;
@@ -480,6 +477,7 @@ class Decoder {
     DLOG(1) << "Decoder:\n";
     for (int i = 0; i < num_syms; ++i) {
       while (len_count[current_len] == current_len_count) {
+        max_code_for_len_[current_len] = current_code;
         ++current_len;
         current_len_count = 0;
         current_inc >>= 1;
@@ -491,18 +489,24 @@ class Decoder {
       };
       DLOG(1) << SymToStr(syms[i]) << " -> "
               << BitCode(current_code, current_len) << "\n";
-      std::fill(
-          dtable_.begin() + current_code,
-          dtable_.begin() + current_code + current_inc,
-          dsym);
+      std::fill(dtable_.begin() + current_code,
+                dtable_.begin() + current_code + current_inc, dsym);
 
       current_code += current_inc;
       ++current_len_count;
+    }
+    for (int j = current_len; j <= 16; ++j)
+      max_code_for_len_[j] = current_code;
+
+    for (int j = 0; j <= 16; ++j) {
+      max_code_for_len_[j] -= 1;
     }
     // Should have exactly wrapped around:
     if (num_syms != 0) {
       assert(current_code == (1 << kMaxCodeLength));
     }
+    max_code_vec_ =
+        _mm256_loadu_si256(reinterpret_cast<__m256i*>(max_code_for_len_));
   }
 
   // TODO: Two symbols at a time decoding.
@@ -510,7 +514,25 @@ class Decoder {
   int Decode(uint16_t code, uint8_t* out_sym) const {
     DLOG(1) << std::format("Decode({:016B}) \n", code);
     DecodedSym dsym = dtable_[code];
+    __m256i c_vec = _mm256_set1_epi16(code);
+
+#if 1
+    // This limits code length to max 15.
+    __m256i gt_max = _mm256_cmpgt_epi16(c_vec, max_code_vec_);
+    // Now, length is the same as the count of 0xffff words in `gt_max`.
+    uint32_t gt_mask = _mm256_movemask_epi8(gt_max);
+    const int len = (CountBits(gt_mask)/2);
+    if (len != dsym.code_len) {
+      DLOG(1) << "AVX FAIL: len=" << len << " while dsym.code_len="<<
+        int(dsym.code_len) << "\n";
+      DLOG(1) << std::format("gt_mask = {:016B}\n", gt_mask)
+        << std::flush;
+      assert(false);
+    }
+#else
     const int len = dsym.code_len;
+#endif
+
     *out_sym = dsym.sym;
     //     std::cout << std::format("Decode: {:016B} -> {}, {}\n", code,
     //     dsym.sym,
@@ -522,12 +544,9 @@ class Decoder {
 
  private:
   std::vector<DecodedSym> dtable_;
-};
 
-struct TrieNode {
-  int max_len = 0;
-  uint32_t mask = 0;
-  DecodedSym* dsyms = nullptr;
+  int16_t max_code_for_len_[16] = {};
+  __m256i max_code_vec_;
 };
 
 using BestDecoder = Decoder;
@@ -710,7 +729,7 @@ std::string CompressMulti(std::string_view raw) {
   assert(compressed.size() == header_size);
   compressed.resize(compressed_size);
 
-  char* part_output[K+1];
+  char* part_output[K + 1];
   for (int k = 0; k <= K; ++k) {
     part_output[k] =
         compressed.data() + header_size + ((k == 0) ? 0 : end_offset[k - 1]);
@@ -718,7 +737,7 @@ std::string CompressMulti(std::string_view raw) {
 
   CodeWriter writer[K];
   for (int k = 0; k < K; ++k) {
-    writer[k].Init(part_output[k], part_output[k+1]);
+    writer[k].Init(part_output[k], part_output[k + 1]);
   }
 
 #if 1
