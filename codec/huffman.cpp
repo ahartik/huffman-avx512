@@ -399,7 +399,8 @@ class CodeReader {
 
   uint16_t code() const {
     assert(64 - bits_used_ >= kMaxCodeLength);
-    return (buf_bits_ >> (64ll - kMaxCodeLength - bits_used_)) & kMaxCodeMask;
+    // return (buf_bits_ >> (64ll - kMaxCodeLength - bits_used_)) & kMaxCodeMask;
+    return (buf_bits_ << bits_used_) >> (64ll - kMaxCodeLength);
   }
 
   void ConsumeFast(int num_bits) { bits_used_ += num_bits; }
@@ -778,9 +779,11 @@ std::string DecompressMulti(std::string_view compressed) {
   }
   CodeReader reader[K];
   for (int k = 0; k < K; ++k) {
-    int start_index = (k == 0) ? 0 : end_offset[k - 1];
-    reader[k].Init(compressed.data() + start_index,
-                   compressed.data() + end_offset[k]);
+    // int start_index = (k == 0) ? 0 : end_offset[k - 1];
+    // reader[k].Init(compressed.data() + start_index,
+    //                compressed.data() + end_offset[k]);
+    // This works just as well and seems slightly faster:
+    reader[k].Init(compressed.data(), compressed.data() + end_offset[k]);
   }
 
   std::string raw(raw_size, 0);
