@@ -888,10 +888,10 @@ void DecodeSingleStream(const Decoder& decoder, const uint8_t* compressed_begin,
   }
 }
 
-template<int K>
-std::string DecompressMultiAvx512(std::string_view compressed) {
-  static_assert(K % 8 == 0);
-  constexpr int M = K / 8;
+std::string DecompressMulti8Avx512(std::string_view compressed) {
+  // TODO: this
+  // constexpr int M = 1; // Superscalar parallelism
+  constexpr int K = 8;  // SIMD parallelism
   const uint32_t raw_size = read_u32(compressed);
   const uint32_t len_mask = read_u32(compressed);
   uint8_t len_count[32] = {};
@@ -947,23 +947,16 @@ std::string DecompressMultiAvx512(std::string_view compressed) {
   }
 
   // 8 indices for reading data
-  __m512i read_v[M];
-  __m512i write_v[M];
-  __m512i read_begin_v[M];
-  __m512i write_limit_v[M];
-  for (int m = 0; m < M; ++m) {
-    read_v[m] = _mm512_loadu_epi64(read_offset + 8 * m);
-    write_v[m] = _mm512_loadu_epi64(write_offset + 8 * m);
-    read_begin_v[m] = _mm512_loadu_epi64(read_begin_offset + 8 * m);
-    write_limit_v[m] = 
-      _mm512_sub_epi64(_mm512_loadu_epi64(write_end + 8 * m),
-          _mm512_set1_epi64(3));
-  }
+  __m512i read_index = _mm512_loadu_epi64(read_offset);
+  __m512i write_index = _mm512_loadu_epi64(write_offset);
 
   const __m512i read_begin = _mm512_loadu_epi64(read_begin_offset);
+  const __m512i write_limit =
+      _mm512_sub_epi64(_mm512_loadu_epi64(write_end), _mm512_set1_epi64(3));
 
   // 8 integers for how many bits of the current word are already consumed.
   __m512i bits_consumed = _mm512_setzero_si512();
+  const __m512i table_mask = _mm512_set1_epi64((1 << kMaxCodeLength) - 1);
 
   // Each iteration decodes 4 bytes
   while (true) {
@@ -1040,12 +1033,5 @@ template std::string DecompressMulti<4>(std::string_view compressed);
 
 template std::string CompressMulti<8>(std::string_view compressed);
 template std::string DecompressMulti<8>(std::string_view compressed);
-
-template std::string CompressMulti<32>(std::string_view compressed);
-template std::string DecompressMulti<32>(std::string_view compressed);
-
-template std::string DecompressMultiAvx512<8>(std::string_view compressed);
-template std::string DecompressMultiAvx512<16>(std::string_view compressed);
-template std::string DecompressMultiAvx512<32>(std::string_view compressed);
 
 }  // namespace huffman

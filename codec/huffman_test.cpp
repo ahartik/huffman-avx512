@@ -27,9 +27,8 @@ class NameGenerator {
 using Compressors = ::testing::Types<huffman::HuffmanCompressor,
       huffman::HuffmanCompressorMulti<4>,
       huffman::HuffmanCompressorMulti<8>,
-      huffman::HuffmanCompressorMulti<32>,
       // XXX: Fix the decompressor
-      huffman::HuffmanCompressorAvx<8>,
+      huffman::HuffmanCompressorAvx,
       huffman::Huff0Compressor
       >;
 TYPED_TEST_SUITE(CompressorTest, Compressors, NameGenerator);
@@ -63,7 +62,6 @@ mollit anim id est laborum.
     )";
 
   string compressed = TypeParam::Compress(raw);
-#if 0
   std::cout << std::flush;
   for (size_t i = 0; i < compressed.size(); ++i) {
     printf("%02x ", int(uint8_t(compressed[i])));
@@ -73,7 +71,6 @@ mollit anim id est laborum.
   }
   printf("\n");
   std::cout << std::flush;
-#endif
   string decompressed = TypeParam::Decompress(compressed);
   EXPECT_EQ(raw, decompressed);
 }

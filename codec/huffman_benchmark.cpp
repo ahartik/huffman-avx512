@@ -158,7 +158,6 @@ DEFINE_BENCHMARKS(::huffman::HuffmanCompressor)
 // DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<2>)
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<4>)
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<8>)
-DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<32>)
-DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvx<8>)
+DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvx)
 
 DEFINE_BENCHMARKS(::huffman::Huff0Compressor)
