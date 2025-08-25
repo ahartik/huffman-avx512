@@ -827,8 +827,7 @@ std::string DecompressMulti(std::string_view compressed) {
 #pragma GCC unroll 8
       for (int k = 0; k < K; ++k) {
         int code_len = decoder.Decode(reader[k].code(), part_output[k]++,
-            /* try_avx= */ false
-            );
+                                      /* try_avx= */ false);
         reader[k].ConsumeFast(code_len);
       }
     }
@@ -897,9 +896,9 @@ void DecodeSingleStream(const Decoder& decoder, const uint8_t* compressed_begin,
 }
 
 std::string DecompressMulti8Avx512(std::string_view compressed) {
-  // TODO: this 
+  // TODO: this
   // constexpr int M = 1; // Superscalar parallelism
-  constexpr int K = 8; // SIMD parallelism
+  constexpr int K = 8;  // SIMD parallelism
   const uint32_t raw_size = read_u32(compressed);
   const uint32_t len_mask = read_u32(compressed);
   uint8_t len_count[32] = {};
@@ -916,11 +915,11 @@ std::string DecompressMulti8Avx512(std::string_view compressed) {
                   num_syms);
   compressed.remove_prefix(num_syms);
 
-  uint64_t end_offset[K] = {};
+  uint64_t read_end_offset[K] = {};
   for (int k = 0; k < K - 1; ++k) {
-    end_offset[k] = read_u32(compressed);
+    read_end_offset[k] = read_u32(compressed);
   }
-  end_offset[K - 1] = compressed.size();
+  read_end_offset[K - 1] = compressed.size();
 
   int sizes[K] = {};
   for (int i = 0; i < K; ++i) {
@@ -935,16 +934,16 @@ std::string DecompressMulti8Avx512(std::string_view compressed) {
   uint8_t* const write_base = reinterpret_cast<uint8_t*>(raw.data());
   const void* const dtable_base = decoder.dtable();
 
-  uint64_t begin_offset[K] = {};
+  uint64_t read_begin_offset[K] = {};
   for (int k = 1; k < K; ++k) {
-    begin_offset[k] = end_offset[k - 1];
+    read_begin_offset[k] = read_end_offset[k - 1];
   }
   uint64_t read_offset[K] = {};
   for (int k = 1; k < K; ++k) {
     // XXX: WORK IN PROGRESS
     //
     // Next step is to convert bit reading to work backwards from the end.
-    read_offset[k] = end_offset[k] - 8;
+    read_offset[k] = read_end_offset[k] - 8;
   }
 
   uint64_t write_offset[K] = {};
@@ -960,10 +959,8 @@ std::string DecompressMulti8Avx512(std::string_view compressed) {
   // 8 indices for reading data
   __m512i read_index = _mm512_loadu_epi64(read_offset);
   __m512i write_index = _mm512_loadu_epi64(write_offset);
-  const __m512i end_offset_vec = _mm512_loadu_epi64(end_offset);
 
-  const __m512i read_limit =
-      _mm512_sub_epi64(end_offset_vec, _mm512_set1_epi64(7));
+  const __m512i read_begin = _mm512_loadu_epi64(read_begin_offset);
   const __m512i write_limit =
       _mm512_sub_epi64(_mm512_loadu_epi64(write_end), _mm512_set1_epi64(3));
 
@@ -973,27 +970,28 @@ std::string DecompressMulti8Avx512(std::string_view compressed) {
 
   // Each iteration decodes 4 bytes
   while (true) {
-    // std::cout << "AVX ITER\n" << std::flush;
+    // Skip forward:
+    // bytes_consumed = bits_consumed / 8;
+    __m512i bytes_consumed = _mm512_srli_epi64(bits_consumed, 3);
+    read_index = _mm512_sub_epi64(read_index, bytes_consumed);
+    // Remainder bits: bits_consumed = bits_consumed % 8;
+    bits_consumed = _mm512_and_epi64(bits_consumed, _mm512_set1_epi64(7));
+
     // Check that we can continue:
     __mmask8 write_bad = _mm512_cmpge_epi64_mask(write_index, write_limit);
-    __mmask8 read_bad = _mm512_cmpge_epi64_mask(read_index, read_limit);
+    __mmask8 read_bad = _mm512_cmplt_epi64_mask(read_index, read_begin);
     __mmask8 some_bad = _kor_mask8(write_bad, read_bad);
     if (_cvtmask8_u32(some_bad) != 0) {
       // TODO: This testing thing is weird, investigate if it can be optimized.
       break;
     }
 
-    // Skip forward:
-    // bytes_consumed = bits_consumed / 8;
-    __m512i bytes_consumed = _mm512_srli_epi64(bits_consumed, 3);
-    read_index = _mm512_add_epi64(read_index, bytes_consumed);
-    // Remainder bits: bits_consumed = bits_consumed % 8;
-    bits_consumed = _mm512_and_epi64(bits_consumed, _mm512_set1_epi64(7));
-
     // Read the bits to decompress
     __m512i bits = _mm512_i64gather_epi64(read_index, read_base, 1);
-    // Shift used bits away
-    bits = _mm512_srlv_epi64(bits, bits_consumed);
+    // Get code:
+    // code = (bits << bits_consumed) >> (64 - kMaxCodeLength).
+    bits = _mm512_srli_epi64(_mm512_sllv_epi64(bits, bits_consumed),
+                             64 - kMaxCodeLength);
 
     __m512i syms = _mm512_setzero_si512();
 #pragma GCC unroll 8
@@ -1031,7 +1029,7 @@ std::string DecompressMulti8Avx512(std::string_view compressed) {
   // Decode 1 byte at a time:
   for (int k = 0; k < K; ++k) {
     DecodeSingleStream(decoder, read_base + read_offset[k],
-                       read_base + end_offset[k], bit_offset[k],
+                       read_base + read_end_offset[k], bit_offset[k],
                        write_base + write_offset[k], write_base + write_end[k]);
   }
   return raw;
