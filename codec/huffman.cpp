@@ -432,11 +432,12 @@ class CodeReader {
                            bits_used_);
   }
 
-  bool FillBufferFast() {
+  // Returns false if FillBuffer() should be used instead.
+  bool FillBufferFast(bool skip_compare = false) {
     DLOG(1) << "FillBufferFast(): bits_used_ = " << bits_used_ << "\n";
     input_ -= bits_used_ >> 3;
     bits_used_ &= 7;
-    if (__builtin_expect(input_ < begin_, 0)) {
+    if (!skip_compare && __builtin_expect(input_ < begin_, 0)) {
       return false;
     } else {
       memcpy(&buf_bits_, input_, 8);
@@ -447,12 +448,16 @@ class CodeReader {
     return true;
   }
 
+  bool is_fast() const {
+    return input_ >= begin_;
+  }
+
  private:
   const char* input_;
   const char* begin_;
   const char* end_;
   uint64_t buf_bits_;
-  int bits_used_;
+  uint64_t bits_used_;
 };
 
 struct DecodedSym {
@@ -486,10 +491,10 @@ class Decoder {
       };
       DLOG(1) << SymToStr(syms[i]) << " -> "
               << BitCode(current_code, current_len) << "\n";
-      for (uint32_t code = current_code; code < (1 << kMaxCodeLength);
-           code += 1) {
-        dtable_[code] = dsym;
-      }
+      std::fill(
+          dtable_.begin() + current_code,
+          dtable_.begin() + current_code + current_inc,
+          dsym);
 
       current_code += current_inc;
       ++current_len_count;
@@ -810,8 +815,13 @@ std::string DecompressMulti(std::string_view compressed) {
     }
 #pragma GCC unroll 8
     for (int k = 0; k < K; ++k) {
+      // The checks inside this call could be made faster for k > 0
+      // if we were certain that decoding of k > 0 did not go further bcak than
+      // for k == 0. This is certain for good inputs, but bad inputs
+      // could be crafted where this is not the case. This optimization would
+      // improve decompression speed by ~1%.
       readers_good &= reader[k].FillBufferFast();
-      // reader[k].FillBuffer();
+      // assert(reader[k].is_fast());
     }
   }
 #endif
