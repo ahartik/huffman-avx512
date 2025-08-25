@@ -50,6 +50,31 @@ TYPED_TEST(CompressorTest, Hello) {
   EXPECT_EQ(raw, decompressed);
 }
 
+TYPED_TEST(CompressorTest, LongerText) {
+  string raw = R"(
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod
+tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim
+veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea
+commodo consequat. Duis aute irure dolor in reprehenderit in voluptate
+velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint
+occaecat cupidatat non proident, sunt in culpa qui officia deserunt
+mollit anim id est laborum.
+    )";
+
+  string compressed = TypeParam::Compress(raw);
+  std::cout << std::flush;
+  for (size_t i = 0; i < compressed.size(); ++i) {
+    printf("%02x ", int(uint8_t(compressed[i])));
+    if (i % 8 == 7) {
+      printf("\n");
+    }
+  }
+  printf("\n");
+  std::cout << std::flush;
+  string decompressed = TypeParam::Decompress(compressed);
+  EXPECT_EQ(raw, decompressed);
+}
+
 TYPED_TEST(CompressorTest, LongRandom) {
   string raw;
   int len = 2000;

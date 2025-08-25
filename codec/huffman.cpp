@@ -386,7 +386,7 @@ class CodeReader {
   void Init(const char* begin, const char* end) {
     DLOG(1) << "CodeReader::Init(" << intptr_t(end - begin) << ")\n"
             << std::flush;
-    assert((end == nullptr) || (begin + 8 <= end));
+    // assert((end == nullptr) || (begin + 8 <= end));
     begin_ = begin;
     input_ = end - 8;
     end_ = end;
@@ -458,8 +458,9 @@ class CodeReader {
 };
 
 struct DecodedSym {
-  uint8_t sym = 0;
+  // NOTE: This order is assumed by some AVX code.
   uint8_t code_len = 0;
+  uint8_t sym = 0;
 };
 
 class Decoder {
@@ -484,8 +485,8 @@ class Decoder {
       }
 
       DecodedSym dsym = {
-          .sym = syms[i],
           .code_len = uint8_t(current_len),
+          .sym = syms[i],
       };
       DLOG(1) << SymToStr(syms[i]) << " -> "
               << BitCode(current_code, current_len) << "\n";
@@ -878,20 +879,12 @@ std::string Int64VecToString(__m512i vec) {
 void DecodeSingleStream(const Decoder& decoder, const uint8_t* compressed_begin,
                         const uint8_t* compressed_end, int bit_offset,
                         uint8_t* out_begin, uint8_t* out_end) {
-  const uint8_t* read_ptr = compressed_begin;
+  CodeReader reader(reinterpret_cast<const char*>(compressed_begin),
+                    reinterpret_cast<const char*>(compressed_end));
+  reader.ConsumeBits(bit_offset);
   for (uint8_t* output = out_begin; output != out_end; ++output) {
-    read_ptr += bit_offset / 8;
-    bit_offset %= 8;
-
-    uint64_t bits = 0;
-    const int bytes_remaining = compressed_end - read_ptr;
-    if (bytes_remaining >= 8) {
-      memcpy(&bits, read_ptr, 8);
-    } else if (bytes_remaining > 0) {
-      memcpy(&bits, read_ptr, bytes_remaining);
-    }
-    bits >>= bit_offset;
-    bit_offset += decoder.Decode(bits & kMaxCodeMask, output);
+    int bits = decoder.Decode(reader.code(), output);
+    reader.ConsumeBits(bits);
   }
 }
 
@@ -939,10 +932,7 @@ std::string DecompressMulti8Avx512(std::string_view compressed) {
     read_begin_offset[k] = read_end_offset[k - 1];
   }
   uint64_t read_offset[K] = {};
-  for (int k = 1; k < K; ++k) {
-    // XXX: WORK IN PROGRESS
-    //
-    // Next step is to convert bit reading to work backwards from the end.
+  for (int k = 0; k < K; ++k) {
     read_offset[k] = read_end_offset[k] - 8;
   }
 
@@ -990,13 +980,12 @@ std::string DecompressMulti8Avx512(std::string_view compressed) {
     __m512i bits = _mm512_i64gather_epi64(read_index, read_base, 1);
     // Get code:
     // code = (bits << bits_consumed) >> (64 - kMaxCodeLength).
-    bits = _mm512_srli_epi64(_mm512_sllv_epi64(bits, bits_consumed),
-                             64 - kMaxCodeLength);
+    bits = _mm512_sllv_epi64(bits, bits_consumed);
 
     __m512i syms = _mm512_setzero_si512();
 #pragma GCC unroll 8
     for (int j = 0; j < 4; ++j) {
-      __m512i index = _mm512_and_epi64(bits, table_mask);
+      __m512i index = _mm512_srli_epi64(bits, 64 - kMaxCodeLength);
       // Table has two bytes for each entry. We read 64 bits for each entry
       // due to two reasons:
       // 1. There is no instruction to "gather" only 2 bytes
@@ -1011,7 +1000,7 @@ std::string DecompressMulti8Avx512(std::string_view compressed) {
       syms = _mm512_or_epi64(syms, _mm512_slli_epi64(this_sym, j * 8));
       __m512i code_len = _mm512_and_epi64(dsyms, _mm512_set1_epi64(0xff));
       // Consume bits
-      bits = _mm512_srlv_epi64(bits, code_len);
+      bits = _mm512_sllv_epi64(bits, code_len);
       bits_consumed = _mm512_add_epi64(bits_consumed, code_len);
     }
     // Perform write:
@@ -1028,8 +1017,8 @@ std::string DecompressMulti8Avx512(std::string_view compressed) {
 
   // Decode 1 byte at a time:
   for (int k = 0; k < K; ++k) {
-    DecodeSingleStream(decoder, read_base + read_offset[k],
-                       read_base + read_end_offset[k], bit_offset[k],
+    DecodeSingleStream(decoder, read_base + read_begin_offset[k],
+                       read_base + read_offset[k] + 8, bit_offset[k],
                        write_base + write_offset[k], write_base + write_end[k]);
   }
   return raw;

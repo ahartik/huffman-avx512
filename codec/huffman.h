@@ -14,7 +14,6 @@ template <int K>
 std::string CompressMulti(std::string_view raw);
 template <int K>
 std::string DecompressMulti(std::string_view compressed);
-
 std::string DecompressMulti8Avx512(std::string_view compressed);
 
 class HuffmanCompressor {
