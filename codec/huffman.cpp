@@ -19,6 +19,26 @@
 
 namespace huffman {
 
+namespace {
+
+// Maximum code length we want to use.  Shorter max code lengths makes for
+// faster compression and decompression.
+const int kMaxCodeLength = 13;
+const uint32_t kMaxCodeMask = (1 << kMaxCodeLength) - 1;
+// Maximum code length that would be optimal in terms of compression.  We use
+// shorter codes with slightly worse compression to gain better performance.
+const int kMaxOptimalCodeLength = 32;
+
+#ifdef HUFF_DEBUG
+#define HUFF_VLOG 1
+#elif !defined(HUFF_VLOG)
+#define HUFF_VLOG 0
+#endif
+
+#define DLOG(level) \
+  if (level <= HUFF_VLOG) std::cout
+}  // namespace
+
 namespace internal {
 
 void CountSymbols(std::string_view text, int* sym_count) {
@@ -109,9 +129,8 @@ struct BitCode {
   // uint16_t mask;
   int16_t len;
   // int16_t pad;
+  //
 };
-
-#ifdef HUFF_DEBUG
 
 std::string SymToStr(uint8_t sym) {
   if (std::isprint(sym)) {
@@ -121,21 +140,13 @@ std::string SymToStr(uint8_t sym) {
   }
 }
 
-void PrintCode(char sym, uint64_t bits, int len) {
-  std::cout << "Sym: " << SymToStr(sym) << ", code: " << bits << " ";
-  if (len < 0 || len > 64) {
-    std::cout << "BAD LEN: " << len << "\n";
-    return;
+std::ostream& operator<<(std::ostream& out, const BitCode& code) {
+  out << "[";
+  for (int i = 0; i < code.len; ++i) {
+    out << ((code.bits >> (kMaxCodeLength - 1 - i)) & 1);
   }
-  for (int i = len - 1; i >= 0; --i) {
-    std::cout << ((bits >> i) & 1);
-  }
-  std::cout << "\n" << std::flush;
-  for (int i = len; i < 64; ++i) {
-    assert(((bits >> i) & 1) == 0);
-  }
+  return out << "]";
 }
-#endif
 
 struct Node {
   int count = 0;
@@ -172,13 +183,6 @@ uint32_t read_u32(std::string_view& in) {
   return x;
 }
 
-// Maximum code length we want to use.  Shorter max code lengths makes for
-// faster compression and decompression.
-const int kMaxCodeLength = 13;
-const uint32_t kMaxCodeMask = (1 << kMaxCodeLength) - 1;
-// Maximum code length that would be optimal in terms of compression.  We use
-// shorter codes with slightly worse compression to gain better performance.
-const int kMaxOptimalCodeLength = 32;
 
 struct CanonicalCoding {
   int sym_count[256] = {};
@@ -204,12 +208,10 @@ void LimitCodeLengths(uint8_t* len_count) {
     kraft_total += (len_count[i] << (kMaxCodeLength - i));
   }
   const uint32_t one = 1 << kMaxCodeLength;
-#ifdef HUFF_DEBUG
-  std::cout << "LimitCodeLengths: adjustment_required " << adjustment_required
-            << "\n";
-  std::cout << "kraft_total: " << kraft_total << " one: " << one << "\n";
-  std::cout << std::flush;
-#endif
+  DLOG(1) << "LimitCodeLengths: adjustment_required " << adjustment_required
+          << "\n";
+  DLOG(1) << "kraft_total: " << kraft_total << " one: " << one << "\n";
+  DLOG(1) << std::flush;
   // int second_longest_len = kMaxCodeLength - 1;
   while (kraft_total > one) {
     // Decrease the length of one code with the maximum length.
@@ -288,7 +290,7 @@ CanonicalCoding MakeCanonicalCoding(std::string_view text) {
   int current_len = 0;
   int current_len_count = 0;
   uint32_t current_code = 0;
-  uint64_t current_inc = 1ull << 16;
+  uint64_t current_inc = 1 << kMaxCodeLength;
   for (int j = 0; j < coding.num_syms; ++j) {
     uint8_t sym = coding.sorted_syms[j];
     while (current_len_count == coding.len_count[current_len]) {
@@ -297,11 +299,10 @@ CanonicalCoding MakeCanonicalCoding(std::string_view text) {
       current_len_count = 0;
     }
     coding.codes[sym].len = current_len;
-    coding.codes[sym].bits = ReverseBits16(current_code);
-    // coding.codes[sym].mask = (1 << current_len) - 1;
-#ifdef HUFF_DEBUG
-    PrintCode(sym, coding.codes[sym].bits, current_len);
-#endif
+    coding.codes[sym].bits = current_code;
+
+    DLOG(1) << SymToStr(sym) << " -> " << coding.codes[sym] << "\n";
+
     current_code += current_inc;
     ++current_len_count;
   }
@@ -310,18 +311,20 @@ CanonicalCoding MakeCanonicalCoding(std::string_view text) {
   std::cout << "compress: current_code at the end: " << current_code << "\n"
             << std::flush;
 #endif
-  assert(current_code == (1ull << 16));
+  assert(current_code == (1ull << kMaxCodeLength));
   return coding;
 }
 
 class CodeWriter {
  public:
-  explicit CodeWriter(char* output) { Init(output); }
+  explicit CodeWriter(char* begin, char* end) { Init(begin, end); }
 
-  CodeWriter() { Init(nullptr); }
+  CodeWriter() { Init(nullptr, nullptr); }
 
-  void Init(char* output) {
-    output_ = output;
+  void Init(char* begin, char* end) {
+    begin_ = begin;
+    end_ = end;
+    output_ = end - 8;
     buf_ = 0;
     buf_size_ = 0;
   }
@@ -332,38 +335,42 @@ class CodeWriter {
   }
 
   void Flush() {
+    DLOG(2) << std::format("Flush(): buf_ = {:016x} buf_size_= {}\n", buf_,
+                           buf_size_);
+    assert(output_ >= begin_);
     int num_bytes = buf_size_ >> 3;
     assert(num_bytes <= 8);
     // This assumes little endian:
     memcpy(output_, &buf_, 8);
-    output_ += num_bytes;
-    buf_ >>= 8 * num_bytes;
+    output_ -= num_bytes;
+    // Leftmost bits were consumed, remaining move to the very left.
+    buf_ <<= 8 * num_bytes;
     buf_size_ -= 8 * num_bytes;
   }
 
   void WriteFast(BitCode code) {
+    DLOG(2) << "WriteFast(" << code << "):\n";
+    DLOG(2) << std::format("buf_ = {:064B} buf_size_= {}\n", buf_, buf_size_);
+
     assert(code.len + buf_size_ <= 64);
-    buf_ |= uint64_t(code.bits) << buf_size_;
+    assert(code.len >= 0);
+    buf_ |= uint64_t(code.bits) << (64 - buf_size_ - kMaxCodeLength);
     buf_size_ += code.len;
   }
 
-  void WriteThreeCodes(BitCode a, BitCode b, BitCode c) {
-    WriteFast(a);
-    WriteFast(b);
-    WriteFast(c);
-    Flush();
-  }
-
   void Finish() {
+    char* out_byte = output_ + 7;
     while (buf_size_ > 0) {
-      uint8_t top = buf_ & 0xff;
-      *output_++ = top;
-      buf_ >>= 8;
+      uint8_t top = (buf_ >> 56) & 0xff;
+      *out_byte-- = top;
+      buf_ <<= 8;
       buf_size_ -= 8;
     }
   }
 
  private:
+  char* begin_;
+  char* end_;
   char* output_;
   uint64_t buf_;
   int buf_size_;
@@ -371,19 +378,29 @@ class CodeWriter {
 
 class CodeReader {
  public:
-  CodeReader() { Init(nullptr, 0); }
+  // After default construction, the object is not safe to use, but is safe to
+  // destruct.
+  CodeReader() { 
+  }
 
-  CodeReader(const char* input, const char* end) { Init(input, end); }
+  CodeReader(const char* begin, const char* end) { Init(begin, end); }
 
-  void Init(const char* input, const char* end) {
-    input_ = input;
+  void Init(const char* begin, const char* end) {
+    DLOG(1) << "CodeReader::Init(" << intptr_t(end-begin) << ")\n"
+      << std::flush;
+    assert((end == nullptr) || (begin + 8 <= end));
+    begin_ = begin;
+    input_ = end - 8;
     end_ = end;
     buf_bits_ = 0;
     bits_used_ = 0;
     FillBuffer();
   }
 
-  uint64_t GetFirstBits() const { return buf_bits_ >> bits_used_; }
+  uint16_t code() const {
+    assert(64 - bits_used_ >= kMaxCodeLength);
+    return (buf_bits_ >> (64ll - kMaxCodeLength - bits_used_)) & kMaxCodeMask;
+  }
 
   void ConsumeFast(int num_bits) { bits_used_ += num_bits; }
 
@@ -393,31 +410,45 @@ class CodeReader {
   }
 
   void FillBuffer() {
-    input_ += (bits_used_ >> 3);
+    DLOG(1) << "FillBuffer(): bits_used_ = " << bits_used_ << "\n";
+    input_ -= bits_used_ >> 3;
     bits_used_ &= 7;
-    if (__builtin_expect(input_ + 8 > end_, 0)) {
-      int num_bytes_available = end_ - input_;
+    if (__builtin_expect(input_ < begin_, 0)) {
+      // Less than 8 bytes remaining, we simulate a read where the lower
+      // address bytes are zero.
+      int num_bytes_available = 8 - (begin_ - input_);
+      DLOG(1) << "num_bytes_available = " << num_bytes_available << "\n";
+      buf_bits_ = 0;
       if (num_bytes_available > 0) {
-        memcpy(&buf_bits_, input_, num_bytes_available);
+        memcpy(&buf_bits_, begin_, 8);
+        buf_bits_ <<= 8 * (begin_ - input_);
       }
     } else {
       memcpy(&buf_bits_, input_, 8);
     }
+    DLOG(1) << "after FillBuffer(): \n";
+    DLOG(1) << std::format("buf_bits_: {:064B} bits_used_: {}\n", buf_bits_,
+                           bits_used_);
   }
 
   bool FillBufferFast() {
-    input_ += (bits_used_ >> 3);
+    DLOG(1) << "FillBufferFast(): bits_used_ = " << bits_used_ << "\n";
+    input_ -= bits_used_ >> 3;
     bits_used_ &= 7;
-    if (__builtin_expect(input_ + 8 > end_, 0)) {
+    if (__builtin_expect(input_ < begin_, 0)) {
       return false;
     } else {
       memcpy(&buf_bits_, input_, 8);
     }
+    DLOG(1) << "after FillBufferFast(): \n";
+    DLOG(1) << std::format("buf_bits_: {:064B} bits_used_: {}\n", buf_bits_,
+                           bits_used_);
     return true;
   }
 
  private:
   const char* input_;
+  const char* begin_;
   const char* end_;
   uint64_t buf_bits_;
   int bits_used_;
@@ -438,8 +469,9 @@ class Decoder {
     int current_len = 0;
     int current_len_count = 0;
     uint32_t current_code = 0;
-    uint64_t current_inc = 1ull << 16;
+    uint64_t current_inc = 1ull << kMaxCodeLength;
     // std::cout << "num_syms: " << num_syms << "\n" << std::flush;
+    DLOG(1) << "Decoder:\n";
     for (int i = 0; i < num_syms; ++i) {
       while (len_count[current_len] == current_len_count) {
         ++current_len;
@@ -451,8 +483,10 @@ class Decoder {
           .code_len = uint8_t(current_len),
           .sym = syms[i],
       };
-      for (uint32_t code = ReverseBits16(current_code);
-           code < (1 << kMaxCodeLength); code += (1 << current_len)) {
+      DLOG(1) << SymToStr(syms[i]) << " -> "
+              << BitCode(current_code, current_len) << "\n";
+      for (uint32_t code = current_code; code < (1 << kMaxCodeLength);
+           code += 1) {
         dtable_[code] = dsym;
       }
 
@@ -461,13 +495,14 @@ class Decoder {
     }
     // Should have exactly wrapped around:
     if (num_syms != 0) {
-      assert(current_code == (1 << 16));
+      assert(current_code == (1 << kMaxCodeLength));
     }
   }
 
   // TODO: Two symbols at a time decoding.
 
   int Decode(uint16_t code, uint8_t* out_sym) const {
+    DLOG(1) << std::format("Decode({:016B}) \n", code);
     DecodedSym dsym = dtable_[code];
     const int len = dsym.code_len;
     *out_sym = dsym.sym;
@@ -623,10 +658,12 @@ std::string Compress(std::string_view raw) {
   compressed.append(reinterpret_cast<char*>(coding.sorted_syms),
                     coding.num_syms);
   const int header_size = compressed.size();
-  const int kSlop = 7;
+  // TODO: Get rid of slop bytes
+  const int kSlop = 8;
   compressed.resize(header_size + (output_bits + 7) / 8 + kSlop);
 
-  CodeWriter writer(&compressed[header_size]);
+  CodeWriter writer(&compressed[header_size],
+                    compressed.data() + compressed.size());
   const uint8_t* input = reinterpret_cast<const uint8_t*>(raw.data());
   const uint8_t* end = input + raw.size();
 
@@ -638,14 +675,15 @@ std::string Compress(std::string_view raw) {
     BitCode b = coding.codes[*input++];
     BitCode c = coding.codes[*input++];
     // BitCode d = coding.codes[*input++];
-    writer.WriteThreeCodes(a, b, c);
+    writer.WriteFast(a);
+    writer.WriteFast(b);
+    writer.WriteFast(c);
+    writer.Flush();
   }
   while (input < end) {
     writer.WriteCode(coding.codes[*input++]);
   }
   writer.Finish();
-
-  compressed.resize(compressed.size() - kSlop);
   return compressed;
 }
 
@@ -680,13 +718,13 @@ std::string Decompress(std::string_view compressed) {
   // Four symbols at a time
   bool readers_good = true;
   while (readers_good & (output + 3 < output_end)) {
-    int a_bits = decoder.Decode(reader.GetFirstBits() & kMaxCodeMask, output++);
+    int a_bits = decoder.Decode(reader.code(), output++);
     reader.ConsumeFast(a_bits);
-    int b_bits = decoder.Decode(reader.GetFirstBits() & kMaxCodeMask, output++);
+    int b_bits = decoder.Decode(reader.code(), output++);
     reader.ConsumeFast(b_bits);
-    int c_bits = decoder.Decode(reader.GetFirstBits() & kMaxCodeMask, output++);
+    int c_bits = decoder.Decode(reader.code(), output++);
     reader.ConsumeFast(c_bits);
-    int d_bits = decoder.Decode(reader.GetFirstBits() & kMaxCodeMask, output++);
+    int d_bits = decoder.Decode(reader.code(), output++);
     reader.ConsumeFast(d_bits);
     readers_good = reader.FillBufferFast();
     // reader.FillBuffer();
@@ -694,8 +732,7 @@ std::string Decompress(std::string_view compressed) {
   // Last symbols
   while (output != output_end) {
     reader.FillBuffer();
-    const uint64_t code = reader.GetFirstBits();
-    int bits_read = decoder.Decode(code & kMaxCodeMask, output++);
+    int bits_read = decoder.Decode(reader.code(), output++);
     reader.ConsumeBits(bits_read);
   }
   return raw;
@@ -723,7 +760,7 @@ std::string CompressMulti(std::string_view raw) {
     part_end[i] = part_input[i] + sizes[i];
   }
 
-  const int kSlop = 7;
+  const int kSlop = 8;
   // Compute starting positions for each part in the output.
   int end_offset[K] = {};
   {
@@ -740,6 +777,11 @@ std::string CompressMulti(std::string_view raw) {
   for (int i = 1; i < K; ++i) {
     end_offset[i] += end_offset[i - 1];
   }
+  DLOG(1) << "End offsets: ";
+  for (int i = 0; i < K; ++i) {
+    DLOG(1) << end_offset[i] << " ";
+  }
+  DLOG(1) << "\n";
 
   // TODO: Use varints
   const size_t header_size =
@@ -768,15 +810,15 @@ std::string CompressMulti(std::string_view raw) {
   assert(compressed.size() == header_size);
   compressed.resize(compressed_size);
 
-  char* part_output[K];
-  for (int k = 0; k < K; ++k) {
+  char* part_output[K+1];
+  for (int k = 0; k <= K; ++k) {
     part_output[k] =
         compressed.data() + header_size + ((k == 0) ? 0 : end_offset[k - 1]);
   }
 
   CodeWriter writer[K];
   for (int k = 0; k < K; ++k) {
-    writer[k].Init(part_output[k]);
+    writer[k].Init(part_output[k], part_output[k+1]);
   }
 
 #if 1
@@ -837,16 +879,14 @@ std::string DecompressMulti(std::string_view compressed) {
   for (size_t i = 0; i < raw_size % K; ++i) {
     ++sizes[i];
   }
-#ifdef HUFF_DEBUG
   for (size_t i = 0; i < K; ++i) {
-    std::cout << std::format("sizes[{}] = {}\n", i, sizes[i]);
+    DLOG(1) << std::format("sizes[{}] = {}\n", i, sizes[i]);
   }
-#endif
   CodeReader reader[K];
   for (int k = 0; k < K; ++k) {
     int start_index = (k == 0) ? 0 : end_offset[k - 1];
     reader[k].Init(compressed.data() + start_index,
-                   compressed.data() + compressed.size());
+                   compressed.data() + end_offset[k]);
   }
 
   std::string raw(raw_size, 0);
@@ -867,8 +907,7 @@ std::string DecompressMulti(std::string_view compressed) {
     for (int j = 0; j < 4; ++j) {
 #pragma GCC unroll 8
       for (int k = 0; k < K; ++k) {
-        int code_len = decoder.Decode(reader[k].GetFirstBits() & kMaxCodeMask,
-                                      part_output[k]++);
+        int code_len = decoder.Decode(reader[k].code(), part_output[k]++);
         reader[k].ConsumeFast(code_len);
       }
     }
@@ -883,13 +922,11 @@ std::string DecompressMulti(std::string_view compressed) {
   for (int k = 0; k < K; ++k) {
     reader[k].FillBuffer();
     while (part_output[k] != part_end[k]) {
-      const uint64_t code = reader[k].GetFirstBits();
-      int bits_read = decoder.Decode(code & kMaxCodeMask, part_output[k]++);
+      const uint64_t code = reader[k].code();
+      int bits_read = decoder.Decode(code, part_output[k]++);
       reader[k].ConsumeBits(bits_read);
-#ifdef HUFF_DEBUG
-      std::cout << "Last sym " << k << " : " << SymToStr(*(part_output[k] - 1))
-                << "\n";
-#endif
+      DLOG(1) << "Last sym " << k << " : " << SymToStr(*(part_output[k] - 1))
+              << "\n";
     }
   }
 
@@ -1063,7 +1100,6 @@ std::string DecompressMulti8Avx512(std::string_view compressed) {
   }
   return raw;
 }
-
 
 template std::string CompressMulti<2>(std::string_view compressed);
 template std::string DecompressMulti<2>(std::string_view compressed);
