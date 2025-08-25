@@ -14,8 +14,8 @@
 #include <format>
 #include <iostream>
 #include <memory>
-#include <vector>
 #include <sstream>
+#include <vector>
 
 namespace huffman {
 
@@ -967,8 +967,7 @@ std::string DecompressMulti8Avx512(std::string_view compressed) {
   std::string raw(raw_size, 0);
   const uint8_t* const read_base =
       reinterpret_cast<const uint8_t*>(compressed.data());
-  uint8_t* const write_base = 
-    reinterpret_cast<uint8_t*>(raw.data());
+  uint8_t* const write_base = reinterpret_cast<uint8_t*>(raw.data());
   const void* const dtable_base = decoder.dtable();
 
   uint64_t read_offset[K] = {};
@@ -1058,17 +1057,13 @@ std::string DecompressMulti8Avx512(std::string_view compressed) {
 
   // Decode 1 byte at a time:
   for (int k = 0; k < K; ++k) {
-    DecodeSingleStream(
-        decoder,
-        read_base + read_offset[k],
-        read_base + end_offset[k],
-        bit_offset[k],
-        write_base + write_offset[k],
-        write_base + write_end[k]
-        );
+    DecodeSingleStream(decoder, read_base + read_offset[k],
+                       read_base + end_offset[k], bit_offset[k],
+                       write_base + write_offset[k], write_base + write_end[k]);
   }
   return raw;
 }
+
 
 template std::string CompressMulti<2>(std::string_view compressed);
 template std::string DecompressMulti<2>(std::string_view compressed);
