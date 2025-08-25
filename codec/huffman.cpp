@@ -914,10 +914,18 @@ std::string DecompressMulti8Avx512(std::string_view compressed) {
   uint8_t* const write_base = reinterpret_cast<uint8_t*>(raw.data());
   const void* const dtable_base = decoder.dtable();
 
+  uint64_t begin_offset[K] = {};
+  for (int k = 1; k < K; ++k) {
+    begin_offset[k] = end_offset[k - 1];
+  }
   uint64_t read_offset[K] = {};
   for (int k = 1; k < K; ++k) {
-    read_offset[k] = end_offset[k - 1];
+    // XXX: WORK IN PROGRESS
+    //
+    // Next step is to convert bit reading to work backwards from the end.
+    read_offset[k] = end_offset[k] - 8;
   }
+
   uint64_t write_offset[K] = {};
   for (int k = 1; k < K; ++k) {
     write_offset[k] = write_offset[k - 1] + sizes[k - 1];
