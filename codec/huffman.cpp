@@ -458,8 +458,8 @@ class CodeReader {
 };
 
 struct DecodedSym {
-  uint8_t code_len = 0;
   uint8_t sym = 0;
+  uint8_t code_len = 0;
 };
 
 class Decoder {
@@ -484,8 +484,8 @@ class Decoder {
       }
 
       DecodedSym dsym = {
-          .code_len = uint8_t(current_len),
           .sym = syms[i],
+          .code_len = uint8_t(current_len),
       };
       DLOG(1) << SymToStr(syms[i]) << " -> "
               << BitCode(current_code, current_len) << "\n";
@@ -495,8 +495,7 @@ class Decoder {
       current_code += current_inc;
       ++current_len_count;
     }
-    for (int j = current_len; j <= 16; ++j)
-      max_code_for_len_[j] = current_code;
+    for (int j = current_len; j <= 16; ++j) max_code_for_len_[j] = current_code;
 
     for (int j = 0; j <= 16; ++j) {
       max_code_for_len_[j] -= 1;
@@ -511,33 +510,30 @@ class Decoder {
 
   // TODO: Two symbols at a time decoding.
 
-  int Decode(uint16_t code, uint8_t* out_sym) const {
+  inline int Decode(uint16_t code, uint8_t* out_sym,
+                    bool try_avx = false) const {
     DLOG(1) << std::format("Decode({:016B}) \n", code);
     DecodedSym dsym = dtable_[code];
     __m256i c_vec = _mm256_set1_epi16(code);
 
-#if 1
-    // This limits code length to max 15.
-    __m256i gt_max = _mm256_cmpgt_epi16(c_vec, max_code_vec_);
-    // Now, length is the same as the count of 0xffff words in `gt_max`.
-    uint32_t gt_mask = _mm256_movemask_epi8(gt_max);
-    const int len = (CountBits(gt_mask)/2);
-    if (len != dsym.code_len) {
-      DLOG(1) << "AVX FAIL: len=" << len << " while dsym.code_len="<<
-        int(dsym.code_len) << "\n";
-      DLOG(1) << std::format("gt_mask = {:016B}\n", gt_mask)
-        << std::flush;
-      assert(false);
-    }
-#else
-    const int len = dsym.code_len;
-#endif
-
     *out_sym = dsym.sym;
-    //     std::cout << std::format("Decode: {:016B} -> {}, {}\n", code,
-    //     dsym.sym,
-    //                              dsym.code_len);
-    return len;
+    int len = 0;
+    if (try_avx) {
+      // This limits code length to max 15 bits, since comparison is signed.
+      __m256i gt_max = _mm256_cmpgt_epi16(c_vec, max_code_vec_);
+      // Now, length is the same as the count of 0xffff words in `gt_max`.
+      uint32_t gt_mask = _mm256_movemask_epi8(gt_max);
+      const int len = (CountBits(gt_mask) / 2);
+      if (HUFF_VLOG > 0 && len != dsym.code_len) {
+        DLOG(1) << "AVX FAIL: len=" << len
+                << " while dsym.code_len=" << int(dsym.code_len) << "\n";
+        DLOG(1) << std::format("gt_mask = {:016B}\n", gt_mask) << std::flush;
+        assert(false);
+      }
+      return len;
+    } else {
+      return dsym.code_len;
+    }
   }
 
   const DecodedSym* dtable() const { return dtable_.data(); }
@@ -828,7 +824,9 @@ std::string DecompressMulti(std::string_view compressed) {
     for (int j = 0; j < 4; ++j) {
 #pragma GCC unroll 8
       for (int k = 0; k < K; ++k) {
-        int code_len = decoder.Decode(reader[k].code(), part_output[k]++);
+        int code_len = decoder.Decode(reader[k].code(), part_output[k]++,
+            /* try_avx= */ false
+            );
         reader[k].ConsumeFast(code_len);
       }
     }
