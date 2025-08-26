@@ -10,8 +10,19 @@ build:asan --copt -fsanitize=address
 build:asan --copt -DADDRESS_SANITIZER
 build:asan --copt -O1
 build:asan --copt -g
+# This is a default on Arch and causes a problem with AVX-512
+# https://gcc.gnu.org/bugzilla/show_bug.cgi?format=multiple&id=110027
+build:asan --copt -fno-stack-protector
 build:asan --copt -fno-omit-frame-pointer
 build:asan --linkopt -fsanitize=address
+
+build:ubsan --strip=never
+build:ubsan --copt -fsanitize=undefined
+build:ubsan --copt -DUNDEFINED_BEHAVIOR_SANITIZER
+build:ubsan --copt -O1
+build:ubsan --copt -g
+build:ubsan --copt -fno-omit-frame-pointer
+build:ubsan --linkopt -fsanitize=undefined
 
 build:profopt -c dbg
 build:profopt --copt -O2

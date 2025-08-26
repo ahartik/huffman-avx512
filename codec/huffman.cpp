@@ -318,7 +318,8 @@ class CodeWriter {
  public:
   explicit CodeWriter(char* begin, char* end) { Init(begin, end); }
 
-  CodeWriter() { Init(nullptr, nullptr); }
+  CodeWriter() {
+  }
 
   void Init(char* begin, char* end) {
     begin_ = begin;
@@ -952,32 +953,34 @@ std::string DecompressMulti8Avx512(std::string_view compressed) {
 
   const __m512i read_begin = _mm512_loadu_epi64(read_begin_offset);
   const __m512i write_limit =
-      _mm512_sub_epi64(_mm512_loadu_epi64(write_end), _mm512_set1_epi64(3));
+      _mm512_sub_epi64(_mm512_loadu_epi64(write_end), _mm512_set1_epi64(7));
 
   // 8 integers for how many bits of the current word are already consumed.
   __m512i bits_consumed = _mm512_setzero_si512();
   const __m512i table_mask = _mm512_set1_epi64((1 << kMaxCodeLength) - 1);
+  const __m512i zero_v = _mm512_setzero_si512();
+
+  __mmask8 good = _cvtu32_mask8(0xff);
 
   // Each iteration decodes 4 bytes
-  while (true) {
+  while (_cvtmask8_u32(good) != 0) {
     // Skip forward:
     // bytes_consumed = bits_consumed / 8;
+
     __m512i bytes_consumed = _mm512_srli_epi64(bits_consumed, 3);
-    read_index = _mm512_sub_epi64(read_index, bytes_consumed);
+    read_index =
+        _mm512_mask_sub_epi64(read_index, good, read_index, bytes_consumed);
     // Remainder bits: bits_consumed = bits_consumed % 8;
-    bits_consumed = _mm512_and_epi64(bits_consumed, _mm512_set1_epi64(7));
+    bits_consumed = _mm512_mask_and_epi64(bits_consumed, good, bits_consumed,
+                                          _mm512_set1_epi64(7));
 
     // Check that we can continue:
-    __mmask8 write_bad = _mm512_cmpge_epi64_mask(write_index, write_limit);
-    __mmask8 read_bad = _mm512_cmplt_epi64_mask(read_index, read_begin);
-    __mmask8 some_bad = _kor_mask8(write_bad, read_bad);
-    if (_cvtmask8_u32(some_bad) != 0) {
-      // TODO: This testing thing is weird, investigate if it can be optimized.
-      break;
-    }
+    good = _kand_mask8(good, _mm512_cmplt_epi64_mask(write_index, write_limit));
+    good = _kand_mask8(good, _mm512_cmpge_epi64_mask(read_index, read_begin));
 
     // Read the bits to decompress
-    __m512i bits = _mm512_i64gather_epi64(read_index, read_base, 1);
+    __m512i bits =
+        _mm512_mask_i64gather_epi64(zero_v, good, read_index, read_base, 1);
     // Get code:
     // code = (bits << bits_consumed) >> (64 - kMaxCodeLength).
     bits = _mm512_sllv_epi64(bits, bits_consumed);
@@ -1001,12 +1004,14 @@ std::string DecompressMulti8Avx512(std::string_view compressed) {
       __m512i code_len = _mm512_and_epi64(dsyms, _mm512_set1_epi64(0xff));
       // Consume bits
       bits = _mm512_sllv_epi64(bits, code_len);
-      bits_consumed = _mm512_add_epi64(bits_consumed, code_len);
+      bits_consumed =
+          _mm512_mask_add_epi64(bits_consumed, good, bits_consumed, code_len);
     }
     // Perform write:
     __m256i syms256 = _mm512_cvtepi64_epi32(syms);
-    _mm512_i64scatter_epi32(write_base, write_index, syms256, 1);
-    write_index = _mm512_add_epi64(write_index, _mm512_set1_epi64(4));
+    _mm512_mask_i64scatter_epi32(write_base, good, write_index, syms256, 1);
+    write_index = _mm512_mask_add_epi64(write_index, good, write_index,
+                                        _mm512_set1_epi64(4));
   }
   // Read the rest using scalar code. This means we need to convert the
   // vectorized state to more regular C++ variables.
