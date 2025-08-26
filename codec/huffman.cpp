@@ -1034,51 +1034,42 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
 
   // Each iteration decodes 0, 4, or 8 bytes for each stream.
   while (some_good()) {
-    DEF_ARR(mask8, write_good,
-            _mm512_cmplt_epi64_mask(write_v[m], write_limit_v[m]));
-    FORM(m) good[m] = _kand_mask8(good[m], write_good[m]);
+    FORM(m) {
+      // good &= write_good;
+      good[m] = _kand_mask8(
+          good[m], _mm512_cmplt_epi64_mask(write_v[m], write_limit_v[m]));
+    }
 
     DEF_VECS(write_len, zero_v);
     DEF_VECS(syms, zero_v);
-    // DEF_VECS(sym_shift, zero_v);
     DEF_VECS(bits, zero_v);
+    // Fill buffer.
+    FORM(m) {
+      const vec8x64 bytes_consumed = _mm512_srli_epi64(bits_consumed_v[m], 3);
+      read_v[m] =
+          _mm512_mask_sub_epi64(read_v[m], good[m], read_v[m], bytes_consumed);
+      // Remainder bits: bits_consumed = bits_consumed % 8;
+      bits_consumed_v[m] =
+          _mm512_mask_and_epi64(bits_consumed_v[m], good[m], bits_consumed_v[m],
+                                _mm512_set1_epi64(7));
+      // Check that we can continue:
+      good[m] = _kand_mask8(
+          good[m], _mm512_cmpge_epi64_mask(read_v[m], read_begin_v[m]));
+      // Read the bits to decompress
+      bits[m] =
+          _mm512_mask_i64gather_epi64(zero_v, good[m], read_v[m], read_base, 1);
+      // Discard the used bits by shifting them out from the left.
+      // code = (bits << bits_consumed) >> (64 - kMaxCodeLength).
+      bits[m] = _mm512_sllv_epi64(bits[m], bits_consumed_v[m]);
+    }
 #pragma GCC unroll 8
     for (int j = 0; j < 4; ++j) {
-      if (j % 4 == 0) {
-        // Fill buffer.
-        FORM(m) {
-          const vec8x64 bytes_consumed =
-              _mm512_srli_epi64(bits_consumed_v[m], 3);
-          read_v[m] = _mm512_mask_sub_epi64(read_v[m], good[m], read_v[m],
-                                            bytes_consumed);
-          // Remainder bits: bits_consumed = bits_consumed % 8;
-          bits_consumed_v[m] =
-              _mm512_mask_and_epi64(bits_consumed_v[m], good[m],
-                                    bits_consumed_v[m], _mm512_set1_epi64(7));
-          // Check that we can continue:
-          good[m] = _kand_mask8(
-              good[m], _mm512_cmpge_epi64_mask(read_v[m], read_begin_v[m]));
-          // Read the bits to decompress
-          bits[m] = _mm512_mask_i64gather_epi64(zero_v, good[m], read_v[m],
-                                                read_base, 1);
-          // Move the code to be read to the highest bits of each int64.
-          // code = (bits << bits_consumed) >> (64 - kMaxCodeLength).
-          bits[m] = _mm512_sllv_epi64(bits[m], bits_consumed_v[m]);
-          // We always write 8 bytes, but some of them may be garbage
-          // TODO: It might be faster to just skip writes altogether instead of
-          // sometimes advancing the write index by 4 bytes only.
-        }
-      }
-
-      // This expression is merged into below.
-      // DEF_VECS(index, _mm512_srli_epi64(bits[m], 64 - kMaxCodeLength));
-
-      // Table has two bytes for each entry. We read 64 bits for each entry
-      // due to two reasons:
-      // 1. There is no instruction to "gather" only 2 bytes
-      // 2. Keeping vector size at 512 bits is faster since no conversions are
-      // required.
       if (decoder.max_symbols_decoded() == 2) {
+        // Table has 4 bytes for each entry. We read 64 bits for each entry
+        // in order to keep the vectors 512 bits.
+
+        // This expression is merged into below.
+        // DEF_VECS(index, _mm512_srli_epi64(bits[m], 64 - kMaxCodeLength));
         DEF_VECS(dsyms, _mm512_i64gather_epi64(
                             _mm512_srli_epi64(bits[m], 64 - kMaxCodeLength),
                             dtable_base, 4));
@@ -1086,13 +1077,12 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
         // decoded symbols in the next 2 bytes, and the number of syms in the
         // fourth byte.
         FORM(m) {
-          vec8x64 this_sym = _mm512_and_epi64(_mm512_srli_epi64(dsyms[m], 8),
-                                              _mm512_set1_epi64(0xffff));
-          // Store decoded symbols in `syms`.
-          
+          vec8x64 these_syms = _mm512_and_epi64(_mm512_srli_epi64(dsyms[m], 8),
+                                                _mm512_set1_epi64(0xffff));
+          // Store decoded symbols in the next bytes of `syms`.
           vec8x64 sym_shift = _mm512_slli_epi64(write_len[m], 3);
           syms[m] = _mm512_or_epi64(syms[m],
-                                    _mm512_sllv_epi64(this_sym, sym_shift));
+                                    _mm512_sllv_epi64(these_syms, sym_shift));
           __m512i code_len =
               _mm512_and_epi64(dsyms[m], _mm512_set1_epi64(0xff));
           // Consume bits
@@ -1102,13 +1092,15 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
 
           vec8x64 num_decoded_syms = _mm512_and_epi64(
               _mm512_srli_epi64(dsyms[m], 24), _mm512_set1_epi64(0xff));
-          vec8x64 num_decoded_bits = _mm512_slli_epi64(num_decoded_syms, 3);
-          // sym_shift[m] = _mm512_mask_add_epi64(sym_shift[m], good[m],
-          //                                      sym_shift[m], num_decoded_bits);
           write_len[m] = _mm512_mask_add_epi64(write_len[m], good[m],
                                                write_len[m], num_decoded_syms);
         }
       } else {
+        // Table has two bytes for each entry. We read 64 bits for each entry
+        // due to two reasons:
+        // 1. There is no instruction to "gather" only 2 bytes
+        // 2. Keeping vector size at 512 bits is faster since no conversions are
+        // required.
         assert(decoder.max_symbols_decoded() == 1);
         DEF_VECS(dsyms, _mm512_i64gather_epi64(
                             _mm512_srli_epi64(bits[m], 64 - kMaxCodeLength),
@@ -1134,8 +1126,7 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
     }
 
     FORM(m) {
-      _mm512_mask_i64scatter_epi64(write_base, write_good[m], write_v[m],
-                                   syms[m], 1);
+      _mm512_mask_i64scatter_epi64(write_base, good[m], write_v[m], syms[m], 1);
       write_v[m] = _mm512_add_epi64(write_v[m], write_len[m]);
     }
   }
