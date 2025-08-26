@@ -1,6 +1,7 @@
 #include "codec/huffman.h"
 #include "codec/huff0.h"
 
+#include <random>
 #include <cstdlib>
 #include <cstdio>
 
@@ -126,16 +127,16 @@ TYPED_TEST(CompressorTest, EmptyString) {
 #endif
 
 TYPED_TEST(CompressorTest, ManyRandom) {
+  std::mt19937 mt;
   int num_iters = 100;
-  srand(0);
   for (int k = 0; k < num_iters; ++k) {
     string raw;
-    int len = 1 + rand() % 200;
+    int len = 1 + mt() % 1000;
     for (int i = 0; i < len; ++i) {
       uint8_t ch = 0;
       do {
         // Make a biased distribution
-        ch = (rand() & rand() & rand()) & 0xff;
+        ch = (mt() & mt()) & 0xff;
         ch ^= 'A';
       } while (!std::isprint(ch));
       raw.push_back(ch);

@@ -186,6 +186,9 @@ uint32_t read_u32(std::string_view& in) {
   return x;
 }
 
+// Iterates all symbols in [syms, syms+num_syms) and calls `func` for each
+// code. `func` should have signature bool(uint8_t sym, BitCode code).
+// If `func` returns false, the iteration is stopped.
 template <typename Func>
 void ForallCodes(const uint8_t* len_count, const uint8_t* syms, int num_syms,
                  Func func) {
@@ -194,7 +197,6 @@ void ForallCodes(const uint8_t* len_count, const uint8_t* syms, int num_syms,
   uint32_t current_code = 0;
   uint64_t current_inc = 1ull << kMaxCodeLength;
   bool aborted = false;
-  // std::cout << "num_syms: " << num_syms << "\n" << std::flush;
   for (int i = 0; i < num_syms; ++i) {
     while (len_count[current_len] == current_len_count) {
       ++current_len;
@@ -524,17 +526,17 @@ struct DecodedSym2x {
   uint8_t num_syms;
 };
 
-class Decoder2x {
+class Decoder2x{
  public:
   Decoder2x(const uint8_t* len_count, const uint8_t* syms, int num_syms)
-      : single_(len_count, syms, num_syms), dtable_(1 << kMaxCodeLength) {
+      : single_(len_count, syms, num_syms), dtable_((1 << kMaxCodeLength) + 4) {
     ForallCodes(len_count, syms, num_syms, [&](uint8_t sym1, BitCode code1) {
       // Iterate over all codes that are short enough that they can be combined
       // with code1.
       uint32_t last_code = code1.bits;
       ForallCodes(len_count, syms, num_syms, [&](uint8_t sym2, BitCode code2) {
         if (code1.len + code2.len > kMaxCodeLength) {
-          // Break iteration.
+          // Break iteration, combined code would be too long for our table.
           return false;
         }
         DecodedSym2x msym;
@@ -542,21 +544,28 @@ class Decoder2x {
         msym.syms[0] = sym1;
         msym.syms[1] = sym2;
         msym.num_syms = 2;
-        uint32_t code = code1.bits | (code2.bits >> (code1.len));
-        int inc = 1 << (kMaxCodeLength - code1.len - code2.len);
-        std::fill(dtable_.data() + code, dtable_.data() + code + inc, msym);
+        const uint32_t code = code1.bits | (code2.bits >> (code1.len));
+        const uint32_t inc = 1 << (kMaxCodeLength - code1.len - code2.len);
+        // This is a micro-optimization: std::fill is slower here for some
+        // reason than a simple loop.
+        //
+        // std::fill(dtable_.data() + code, dtable_.data() + code + inc, msym);
+        for (uint32_t j = code; j < code + inc; ++j) {
+          dtable_[j] = msym;
+        }
         last_code = code + inc;
         return true;
       });
       // Other codes following code1 must be decoded one symbol at a time.
-      int inc = 1 << (kMaxCodeLength - code1.len);
       DecodedSym2x msym;
       msym.num_bits_decoded = code1.len;
       msym.syms[0] = sym1;
       msym.syms[1] = 0;
       msym.num_syms = 1;
-      std::fill(dtable_.data() + last_code, dtable_.data() + code1.bits + inc,
-                msym);
+      uint32_t inc = 1 << (kMaxCodeLength - code1.len);
+      for (uint32_t j = last_code; j < code1.bits + inc; ++j) dtable_[j] = msym;
+      // std::fill(dtable_.data() + last_code, dtable_.data() + code1.bits + inc,
+      //           msym);
       return true;
     });
   }
@@ -638,9 +647,6 @@ std::string Compress(std::string_view raw) {
   writer.Finish();
   return compressed;
 }
-
-template <bool twox>
-using DecoderMaybe2x = std::conditional_t<twox, Decoder2x, Decoder1x>;
 
 template <typename UsedDecoder>
 std::string DecompressImpl(std::string_view compressed) {
@@ -905,12 +911,12 @@ std::string DecompressMulti(std::string_view compressed) {
 }
 
 std::string Int64VecToString(__m512i vec) {
-  int64_t nums[8];
+  uint64_t nums[8];
   _mm512_storeu_epi64(nums, vec);
   std::ostringstream s;
   s << "[";
   for (int i = 0; i < 8; ++i) {
-    s << nums[i];
+    s << std::format("{:016x}", nums[i]);
     if (i != 7) {
       s << ", ";
     }
@@ -941,6 +947,13 @@ void DecodeSingleStream(const UsedDecoder& decoder,
   }
 }
 
+bool VecEqual(__m512i a, __m512i b) {
+  __mmask8 k = _mm512_cmpeq_epi64_mask(a, b);
+  uint32_t mask_i = _cvtmask8_u32(k);
+  std::cout << "mask_i = " << mask_i << "\n";
+  return mask_i == 0xff;
+}
+
 template <int K, bool multi_table>
 std::string DecompressMultiAvx512Impl(std::string_view compressed) {
   static_assert(K % 8 == 0);
@@ -957,8 +970,9 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
     }
   }
 
-  Decoder2x decoder(len_count, reinterpret_cast<const uint8_t*>(&compressed[0]),
-                    num_syms);
+  // Use bit lengths instead in the decoder table.
+  Decoder2x decoder(
+      len_count, reinterpret_cast<const uint8_t*>(&compressed[0]), num_syms);
   compressed.remove_prefix(num_syms);
 
   uint64_t read_end_offset[K] = {};
@@ -1027,24 +1041,23 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
   DEF_ARR(mask8, good, _mm512_cmplt_epi64_mask(write_v[m], write_limit_v[m]));
 
   auto some_good = [&good]() {
-    uint32_t good_mask = 0;
-    FORM(m) { good_mask |= _cvtmask8_u32(good[m]); }
-    return good_mask != 0;
+    mask8 all = good[0];
+    UNROLL8 for (int m = 1; m < M; ++m) { all = _kor_mask8(all, good[m]); }
+    return _cvtmask8_u32(all) != 0;
   };
 
-  // Each iteration decodes 0, 4, or 8 bytes for each stream.
+  // Each iteration performs 4 decodes for each stream. With Decoder2x, each
+  // decode can result in either 1 or 2 bytes decoded.
   while (some_good()) {
-    FORM(m) {
-      // good &= write_good;
-      good[m] = _kand_mask8(
-          good[m], _mm512_cmplt_epi64_mask(write_v[m], write_limit_v[m]));
-    }
-
     DEF_VECS(write_len, zero_v);
     DEF_VECS(syms, zero_v);
     DEF_VECS(bits, zero_v);
     // Fill buffer.
     FORM(m) {
+      // Update mask based on which streams still have output space left.
+      good[m] = _kand_mask8(
+          good[m], _mm512_cmplt_epi64_mask(write_v[m], write_limit_v[m]));
+
       const vec8x64 bytes_consumed = _mm512_srli_epi64(bits_consumed_v[m], 3);
       read_v[m] =
           _mm512_mask_sub_epi64(read_v[m], good[m], read_v[m], bytes_consumed);
@@ -1055,6 +1068,7 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
       // Check that we can continue:
       good[m] = _kand_mask8(
           good[m], _mm512_cmpge_epi64_mask(read_v[m], read_begin_v[m]));
+
       // Read the bits to decompress
       bits[m] =
           _mm512_mask_i64gather_epi64(zero_v, good[m], read_v[m], read_base, 1);
@@ -1062,8 +1076,7 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
       // code = (bits << bits_consumed) >> (64 - kMaxCodeLength).
       bits[m] = _mm512_sllv_epi64(bits[m], bits_consumed_v[m]);
     }
-#pragma GCC unroll 8
-    for (int j = 0; j < 4; ++j) {
+    UNROLL8 for (int j = 0; j < 4; ++j) {
       if (decoder.max_symbols_decoded() == 2) {
         // Table has 4 bytes for each entry. We read 64 bits for each entry
         // in order to keep the vectors 512 bits.
@@ -1073,25 +1086,50 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
         DEF_VECS(dsyms, _mm512_i64gather_epi64(
                             _mm512_srli_epi64(bits[m], 64 - kMaxCodeLength),
                             dtable_base, 4));
+        static_assert(sizeof(DecodedSym2x) == 4);
         // Now, code length is stored in the lowest byte of each 64-bit word,
         // decoded symbols in the next 2 bytes, and the number of syms in the
         // fourth byte.
         FORM(m) {
+#if 1
+          // The 64-byte vector contains symbols at byte positions
+          // 1,2,9,10,17,18,...
+          // Note: _mm512_shuffle_epi8 (vpshufb) shuffles across each 128-bit
+          // lane, not across the whole 512-bit vector.
+          const vec8x64 symbol_shuffle_ctrl =
+              _mm512_set4_epi64(0xffffffffffff0a09, 0xffffffffffff0201,
+                                0xffffffffffff0a09, 0xffffffffffff0201);
+          vec8x64 these_syms =
+              _mm512_shuffle_epi8(dsyms[m], symbol_shuffle_ctrl);
+#else
           vec8x64 these_syms = _mm512_and_epi64(_mm512_srli_epi64(dsyms[m], 8),
                                                 _mm512_set1_epi64(0xffff));
+#endif
+
           // Store decoded symbols in the next bytes of `syms`.
-          vec8x64 sym_shift = _mm512_slli_epi64(write_len[m], 3);
+          const vec8x64 sym_shift = _mm512_slli_epi64(write_len[m], 3);
           syms[m] = _mm512_or_epi64(syms[m],
                                     _mm512_sllv_epi64(these_syms, sym_shift));
-          __m512i code_len =
+
+          // Consume bits from input.
+          const vec8x64 code_len =
               _mm512_and_epi64(dsyms[m], _mm512_set1_epi64(0xff));
-          // Consume bits
           bits[m] = _mm512_sllv_epi64(bits[m], code_len);
           bits_consumed_v[m] = _mm512_mask_add_epi64(
               bits_consumed_v[m], good[m], bits_consumed_v[m], code_len);
 
+          // The number of symbols (either 1 or 2) is stored in the fourth byte
+          // of the decoder table entry.
+#if 0
           vec8x64 num_decoded_syms = _mm512_and_epi64(
               _mm512_srli_epi64(dsyms[m], 24), _mm512_set1_epi64(0xff));
+#else
+          const vec8x64 num_decoded_syms_ctrl =
+              _mm512_set4_epi64(0xffffffffffffff0b, 0xffffffffffffff03,
+                                0xffffffffffffff0b, 0xffffffffffffff03);
+          vec8x64 num_decoded_syms =
+              _mm512_shuffle_epi8(dsyms[m], num_decoded_syms_ctrl);
+#endif
           write_len[m] = _mm512_mask_add_epi64(write_len[m], good[m],
                                                write_len[m], num_decoded_syms);
         }
@@ -1127,6 +1165,7 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
 
     FORM(m) {
       _mm512_mask_i64scatter_epi64(write_base, good[m], write_v[m], syms[m], 1);
+      // write_len[m] = _mm512_srli_epi64(write_len[m], 3);
       write_v[m] = _mm512_add_epi64(write_v[m], write_len[m]);
     }
   }
