@@ -202,8 +202,7 @@ void ForallCodes(const uint8_t* len_count, const uint8_t* syms, int num_syms,
       current_inc >>= 1;
     }
 
-    if (!func(syms[i],
-              BitCode{uint16_t(current_code), int16_t(current_len)})) {
+    if (!func(syms[i], BitCode{uint16_t(current_code), int16_t(current_len)})) {
       aborted = true;
       break;
     }
@@ -479,11 +478,11 @@ struct DecodedSym {
   uint8_t sym = 0;
 };
 
-class Decoder {
+class Decoder1x {
  public:
-  Decoder(const uint8_t* len_count, const uint8_t* syms, int num_syms)
+  Decoder1x(const uint8_t* len_count, const uint8_t* syms, int num_syms)
       : dtable_((1 << kMaxCodeLength) + 4) {
-    DLOG(1) << "Decoder:\n";
+    DLOG(1) << "Decoder1x:\n";
     ForallCodes(len_count, syms, num_syms, [this](uint8_t sym, BitCode code) {
       uint32_t inc = 1 << (kMaxCodeLength - code.len);
       DecodedSym dsym = {
@@ -507,7 +506,13 @@ class Decoder {
     return dsym.code_len;
   }
 
+  inline int Decode1(uint16_t code, uint8_t** out_sym) const {
+    return Decode(code, out_sym);
+  }
+
   const DecodedSym* dtable() const { return dtable_.data(); }
+
+  int max_symbols_decoded() const { return 1; }
 
  private:
   std::vector<DecodedSym> dtable_;
@@ -522,29 +527,27 @@ struct DecodedSym2x {
 class Decoder2x {
  public:
   Decoder2x(const uint8_t* len_count, const uint8_t* syms, int num_syms)
-      : dtable_(1 << kMaxCodeLength) {
+      : single_(len_count, syms, num_syms), dtable_(1 << kMaxCodeLength) {
     ForallCodes(len_count, syms, num_syms, [&](uint8_t sym1, BitCode code1) {
       // Iterate over all codes that are short enough that they can be combined
       // with code1.
       uint32_t last_code = code1.bits;
-      ForallCodes(len_count, syms, num_syms,
-                  [&](uint8_t sym2, BitCode code2) {
-                    if (code1.len + code2.len > kMaxCodeLength) {
-                      // Break iteration.
-                      return false;
-                    }
-                    DecodedSym2x msym;
-                    msym.num_bits_decoded = code1.len + code2.len;
-                    msym.syms[0] = sym1;
-                    msym.syms[1] = sym2;
-                    msym.num_syms = 2;
-                    uint32_t code = code1.bits | (code2.bits >> (code1.len));
-                    int inc = 1 << (kMaxCodeLength - code1.len - code2.len);
-                    std::fill(dtable_.data() + code,
-                              dtable_.data() + code + inc, msym);
-                    last_code = code + inc;
-                    return true;
-                  });
+      ForallCodes(len_count, syms, num_syms, [&](uint8_t sym2, BitCode code2) {
+        if (code1.len + code2.len > kMaxCodeLength) {
+          // Break iteration.
+          return false;
+        }
+        DecodedSym2x msym;
+        msym.num_bits_decoded = code1.len + code2.len;
+        msym.syms[0] = sym1;
+        msym.syms[1] = sym2;
+        msym.num_syms = 2;
+        uint32_t code = code1.bits | (code2.bits >> (code1.len));
+        int inc = 1 << (kMaxCodeLength - code1.len - code2.len);
+        std::fill(dtable_.data() + code, dtable_.data() + code + inc, msym);
+        last_code = code + inc;
+        return true;
+      });
       // Other codes following code1 must be decoded one symbol at a time.
       int inc = 1 << (kMaxCodeLength - code1.len);
       DecodedSym2x msym;
@@ -566,15 +569,20 @@ class Decoder2x {
     return dsym.num_bits_decoded;
   }
 
+  inline int Decode1(uint16_t code, uint8_t** out_sym) const {
+    return single_.Decode(code, out_sym);
+  }
+
   const DecodedSym2x* dtable() const { return dtable_.data(); }
 
-  static constexpr int max_syms_decoded = 2;
+  int max_symbols_decoded() const { return 2; }
+
+  using DecodedSymT = DecodedSym2x;
 
  private:
+  Decoder1x single_;
   std::vector<DecodedSym2x> dtable_;
 };
-
-using BestDecoder = Decoder;
 
 }  // namespace
 
@@ -631,7 +639,11 @@ std::string Compress(std::string_view raw) {
   return compressed;
 }
 
-std::string Decompress(std::string_view compressed) {
+template <bool twox>
+using DecoderMaybe2x = std::conditional_t<twox, Decoder2x, Decoder1x>;
+
+template <typename UsedDecoder>
+std::string DecompressImpl(std::string_view compressed) {
   // Build codebook.
   const uint32_t raw_size = read_u32(compressed);
   const uint32_t len_mask = read_u32(compressed);
@@ -650,7 +662,7 @@ std::string Decompress(std::string_view compressed) {
     // bits. We can just handle this case by itself:
     return std::string(raw_size, compressed[0]);
   }
-  BestDecoder decoder(
+  UsedDecoder decoder(
       len_count, reinterpret_cast<const uint8_t*>(compressed.data()), num_syms);
   compressed.remove_prefix(num_syms);
 
@@ -661,25 +673,29 @@ std::string Decompress(std::string_view compressed) {
   uint8_t* output_end = output + raw_size;
   // Four symbols at a time
   bool readers_good = true;
-  while (readers_good & (output + 3 < output_end)) {
+
+  const int output_slop = 4 * decoder.max_symbols_decoded() - 1;
+
+  while (readers_good & (output + output_slop < output_end)) {
     UNROLL8 for (int j = 0; j < 4; ++j) {
       int num_bits = decoder.Decode(reader.code(), &output);
       reader.ConsumeFast(num_bits);
     }
     readers_good = reader.FillBufferFast();
   }
+
   // Last symbols
   while (output != output_end) {
     reader.FillBuffer();
-    int bits_read = decoder.Decode(reader.code(), &output);
+    int bits_read = decoder.Decode1(reader.code(), &output);
     reader.ConsumeBits(bits_read);
   }
   return raw;
 }
 
-template<bool twox>
-using DecoderMaybe2x = std::conditional_t<twox,
-      Decoder2x, Decoder>;
+std::string Decompress(std::string_view compressed) {
+  return DecompressImpl<Decoder2x>(compressed);
+}
 
 template <int K>
 std::string CompressMulti(std::string_view raw) {
@@ -791,8 +807,8 @@ std::string CompressMulti(std::string_view raw) {
   return compressed;
 }
 
-template <int K>
-std::string DecompressMulti(std::string_view compressed) {
+template <int K, typename UsedDecoder>
+std::string DecompressMultiImpl(std::string_view compressed) {
   const uint32_t raw_size = read_u32(compressed);
   const uint32_t len_mask = read_u32(compressed);
   uint8_t len_count[32] = {};
@@ -805,7 +821,7 @@ std::string DecompressMulti(std::string_view compressed) {
     }
   }
 
-  BestDecoder decoder(
+  UsedDecoder decoder(
       len_count, reinterpret_cast<const uint8_t*>(&compressed[0]), num_syms);
   compressed.remove_prefix(num_syms);
 
@@ -845,35 +861,35 @@ std::string DecompressMulti(std::string_view compressed) {
     part_end[k] = part_output[k] + sizes[k];
   }
 
-#if 1
-  bool readers_good = true;
-  while (readers_good & (part_output[K - 1] + 3 < part_end[K - 1])) {
-#pragma GCC unroll 8
-    for (int j = 0; j < 4; ++j) {
-#pragma GCC unroll 8
-      for (int k = 0; k < K; ++k) {
-        int code_len = decoder.Decode(reader[k].code(), &part_output[k]);
-        reader[k].ConsumeFast(code_len);
-      }
-    }
-#pragma GCC unroll 8
-    for (int k = 0; k < K; ++k) {
+  const int output_slop = 4 * decoder.max_symbols_decoded() - 1;
+  while (true) {
+    bool can_continue = true;
+    UNROLL8 for (int k = 0; k < K; ++k) {
       // The checks inside this call could be made faster for k > 0
       // if we were certain that decoding of k > 0 did not go further bcak than
       // for k == 0. This is certain for good inputs, but bad inputs
       // could be crafted where this is not the case. This optimization would
       // improve decompression speed by ~1%.
-      readers_good &= reader[k].FillBufferFast();
+      can_continue &= reader[k].FillBufferFast();
       // assert(reader[k].is_fast());
+      can_continue &= part_output[k] + output_slop < part_end[k];
+    }
+    if (!can_continue) {
+      break;
+    }
+    UNROLL8 for (int j = 0; j < 4; ++j) {
+      UNROLL8 for (int k = 0; k < K; ++k) {
+        int code_len = decoder.Decode(reader[k].code(), &part_output[k]);
+        reader[k].ConsumeFast(code_len);
+      }
     }
   }
-#endif
   // Read last symbols.
   for (int k = 0; k < K; ++k) {
     reader[k].FillBuffer();
     while (part_output[k] != part_end[k]) {
       const uint64_t code = reader[k].code();
-      int bits_read = decoder.Decode(code, &part_output[k]);
+      int bits_read = decoder.Decode1(code, &part_output[k]);
       reader[k].ConsumeBits(bits_read);
       DLOG(1) << "Last sym " << k << " : " << SymToStr(*(part_output[k] - 1))
               << "\n";
@@ -881,6 +897,11 @@ std::string DecompressMulti(std::string_view compressed) {
   }
 
   return raw;
+}
+
+template <int K>
+std::string DecompressMulti(std::string_view compressed) {
+  return DecompressMultiImpl<K, Decoder2x>(compressed);
 }
 
 std::string Int64VecToString(__m512i vec) {
@@ -900,14 +921,22 @@ std::string Int64VecToString(__m512i vec) {
 
 // Slowish method for decoding a single stream. Used to finish off decoding one
 // character at a time.
-void DecodeSingleStream(const Decoder& decoder, const uint8_t* compressed_begin,
+
+template <typename UsedDecoder>
+void DecodeSingleStream(const UsedDecoder& decoder,
+                        const uint8_t* compressed_begin,
                         const uint8_t* compressed_end, int bit_offset,
                         uint8_t* out_begin, uint8_t* out_end) {
   CodeReader reader(reinterpret_cast<const char*>(compressed_begin),
                     reinterpret_cast<const char*>(compressed_end));
   reader.ConsumeBits(bit_offset);
-  for (uint8_t* output = out_begin; output != out_end;) {
+  uint8_t* output = out_begin;
+  while (output <= out_end - decoder.max_symbols_decoded()) {
     int bits = decoder.Decode(reader.code(), &output);
+    reader.ConsumeBits(bits);
+  }
+  while (output < out_end) {
+    int bits = decoder.Decode1(reader.code(), &output);
     reader.ConsumeBits(bits);
   }
 }
@@ -928,8 +957,8 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
     }
   }
 
-  Decoder decoder(len_count, reinterpret_cast<const uint8_t*>(&compressed[0]),
-                  num_syms);
+  Decoder2x decoder(len_count, reinterpret_cast<const uint8_t*>(&compressed[0]),
+                    num_syms);
   compressed.remove_prefix(num_syms);
 
   uint64_t read_end_offset[K] = {};
@@ -972,9 +1001,9 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
 
   using vec8x64 = __m512i;
 
-#define DEF_ARR(type, name, val)                                             \
-  type name[M];                                                              \
-  do {                                                                       \
+#define DEF_ARR(type, name, val)                             \
+  type name[M];                                              \
+  do {                                                       \
     UNROLL8 for (int m = 0; m < M; ++m) { name[m] = (val); } \
   } while (0)
 
@@ -1011,9 +1040,10 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
 
     DEF_VECS(write_len, zero_v);
     DEF_VECS(syms, zero_v);
+    // DEF_VECS(sym_shift, zero_v);
     DEF_VECS(bits, zero_v);
 #pragma GCC unroll 8
-    for (int j = 0; j < 8; ++j) {
+    for (int j = 0; j < 4; ++j) {
       if (j % 4 == 0) {
         // Fill buffer.
         FORM(m) {
@@ -1037,8 +1067,6 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
           // We always write 8 bytes, but some of them may be garbage
           // TODO: It might be faster to just skip writes altogether instead of
           // sometimes advancing the write index by 4 bytes only.
-          write_len[m] = _mm512_mask_add_epi64(
-              write_len[m], good[m], write_len[m], _mm512_set1_epi64(4));
         }
       }
 
@@ -1050,22 +1078,58 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
       // 1. There is no instruction to "gather" only 2 bytes
       // 2. Keeping vector size at 512 bits is faster since no conversions are
       // required.
-      DEF_VECS(dsyms, _mm512_i64gather_epi64(
-                          _mm512_srli_epi64(bits[m], 64 - kMaxCodeLength),
-                          dtable_base, 2));
-      // Now, code length is stored in the lowest byte of each 64-bit word, and
-      // the symbol in the second-lowest byte.
+      if (decoder.max_symbols_decoded() == 2) {
+        DEF_VECS(dsyms, _mm512_i64gather_epi64(
+                            _mm512_srli_epi64(bits[m], 64 - kMaxCodeLength),
+                            dtable_base, 4));
+        // Now, code length is stored in the lowest byte of each 64-bit word,
+        // decoded symbols in the next 2 bytes, and the number of syms in the
+        // fourth byte.
+        FORM(m) {
+          vec8x64 this_sym = _mm512_and_epi64(_mm512_srli_epi64(dsyms[m], 8),
+                                              _mm512_set1_epi64(0xffff));
+          // Store decoded symbols in `syms`.
+          
+          vec8x64 sym_shift = _mm512_slli_epi64(write_len[m], 3);
+          syms[m] = _mm512_or_epi64(syms[m],
+                                    _mm512_sllv_epi64(this_sym, sym_shift));
+          __m512i code_len =
+              _mm512_and_epi64(dsyms[m], _mm512_set1_epi64(0xff));
+          // Consume bits
+          bits[m] = _mm512_sllv_epi64(bits[m], code_len);
+          bits_consumed_v[m] = _mm512_mask_add_epi64(
+              bits_consumed_v[m], good[m], bits_consumed_v[m], code_len);
 
-      FORM(m) {
-        vec8x64 this_sym = _mm512_and_epi64(_mm512_srli_epi64(dsyms[m], 8),
-                                            _mm512_set1_epi64(0xff));
-        // Store decoded symbols in `syms`.
-        syms[m] = _mm512_or_epi64(syms[m], _mm512_slli_epi64(this_sym, j * 8));
-        __m512i code_len = _mm512_and_epi64(dsyms[m], _mm512_set1_epi64(0xff));
-        // Consume bits
-        bits[m] = _mm512_sllv_epi64(bits[m], code_len);
-        bits_consumed_v[m] = _mm512_mask_add_epi64(
-            bits_consumed_v[m], good[m], bits_consumed_v[m], code_len);
+          vec8x64 num_decoded_syms = _mm512_and_epi64(
+              _mm512_srli_epi64(dsyms[m], 24), _mm512_set1_epi64(0xff));
+          vec8x64 num_decoded_bits = _mm512_slli_epi64(num_decoded_syms, 3);
+          // sym_shift[m] = _mm512_mask_add_epi64(sym_shift[m], good[m],
+          //                                      sym_shift[m], num_decoded_bits);
+          write_len[m] = _mm512_mask_add_epi64(write_len[m], good[m],
+                                               write_len[m], num_decoded_syms);
+        }
+      } else {
+        assert(decoder.max_symbols_decoded() == 1);
+        DEF_VECS(dsyms, _mm512_i64gather_epi64(
+                            _mm512_srli_epi64(bits[m], 64 - kMaxCodeLength),
+                            dtable_base, 2));
+        // Now, code length is stored in the lowest byte of each 64-bit word,
+        // and the symbol in the second-lowest byte.
+        FORM(m) {
+          vec8x64 this_sym = _mm512_and_epi64(_mm512_srli_epi64(dsyms[m], 8),
+                                              _mm512_set1_epi64(0xff));
+          // Store decoded symbols in `syms`.
+          syms[m] =
+              _mm512_or_epi64(syms[m], _mm512_slli_epi64(this_sym, j * 8));
+          __m512i code_len =
+              _mm512_and_epi64(dsyms[m], _mm512_set1_epi64(0xff));
+          // Consume bits
+          bits[m] = _mm512_sllv_epi64(bits[m], code_len);
+          bits_consumed_v[m] = _mm512_mask_add_epi64(
+              bits_consumed_v[m], good[m], bits_consumed_v[m], code_len);
+          write_len[m] = _mm512_mask_add_epi64(
+              write_len[m], good[m], write_len[m], _mm512_set1_epi64(4));
+        }
       }
     }
 
