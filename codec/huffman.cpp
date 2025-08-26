@@ -960,34 +960,46 @@ std::string DecompressMulti8Avx512(std::string_view compressed) {
   const __m512i table_mask = _mm512_set1_epi64((1 << kMaxCodeLength) - 1);
   const __m512i zero_v = _mm512_setzero_si512();
 
-  __mmask8 good = _cvtu32_mask8(0xff);
+  using vec8x64 = __m512i;
+
+  __mmask8 good = _mm512_cmplt_epi64_mask(write_index, write_limit);
 
   // Each iteration decodes 4 bytes
   while (_cvtmask8_u32(good) != 0) {
+    __mmask8 write_good = _mm512_cmplt_epi64_mask(write_index, write_limit);
+    good = _kand_mask8(good, write_good);
     // Skip forward:
     // bytes_consumed = bits_consumed / 8;
 
-    __m512i bytes_consumed = _mm512_srli_epi64(bits_consumed, 3);
-    read_index =
-        _mm512_mask_sub_epi64(read_index, good, read_index, bytes_consumed);
-    // Remainder bits: bits_consumed = bits_consumed % 8;
-    bits_consumed = _mm512_mask_and_epi64(bits_consumed, good, bits_consumed,
-                                          _mm512_set1_epi64(7));
-
-    // Check that we can continue:
-    good = _kand_mask8(good, _mm512_cmplt_epi64_mask(write_index, write_limit));
-    good = _kand_mask8(good, _mm512_cmpge_epi64_mask(read_index, read_begin));
-
-    // Read the bits to decompress
-    __m512i bits =
-        _mm512_mask_i64gather_epi64(zero_v, good, read_index, read_base, 1);
-    // Get code:
-    // code = (bits << bits_consumed) >> (64 - kMaxCodeLength).
-    bits = _mm512_sllv_epi64(bits, bits_consumed);
-
-    __m512i syms = _mm512_setzero_si512();
+    __m512i write_len = _mm512_set1_epi64(0);
+    __m512i syms = zero_v;
+    __m512i bits = zero_v;
 #pragma GCC unroll 8
-    for (int j = 0; j < 4; ++j) {
+    for (int j = 0; j < 8; ++j) {
+      if (j % 4 == 0) {
+        // Fill buffer.
+        __m512i bytes_consumed = _mm512_srli_epi64(bits_consumed, 3);
+        read_index =
+            _mm512_mask_sub_epi64(read_index, good, read_index, bytes_consumed);
+        // Remainder bits: bits_consumed = bits_consumed % 8;
+        bits_consumed = _mm512_mask_and_epi64(bits_consumed, good, bits_consumed,
+                                              _mm512_set1_epi64(7));
+        // Check that we can continue:
+        good = _kand_mask8(good, _mm512_cmpge_epi64_mask(read_index, read_begin));
+        // Read the bits to decompress
+        bits =
+            _mm512_mask_i64gather_epi64(zero_v, good, read_index, read_base, 1);
+        // Move the code to be read to the highest bits of each int64.
+        // code = (bits << bits_consumed) >> (64 - kMaxCodeLength).
+        bits = _mm512_sllv_epi64(bits, bits_consumed);
+        // We always write 8 bytes, but some of them may be garbage
+        // TODO: It might be faster to just skip writes altogether instead of
+        // sometimes advancing the write index by 4 bytes only.
+        write_len = _mm512_mask_add_epi64(
+            write_len, good, write_len,
+            _mm512_set1_epi64(4));
+      }
+
       __m512i index = _mm512_srli_epi64(bits, 64 - kMaxCodeLength);
       // Table has two bytes for each entry. We read 64 bits for each entry
       // due to two reasons:
@@ -1007,11 +1019,9 @@ std::string DecompressMulti8Avx512(std::string_view compressed) {
       bits_consumed =
           _mm512_mask_add_epi64(bits_consumed, good, bits_consumed, code_len);
     }
-    // Perform write:
-    __m256i syms256 = _mm512_cvtepi64_epi32(syms);
-    _mm512_mask_i64scatter_epi32(write_base, good, write_index, syms256, 1);
-    write_index = _mm512_mask_add_epi64(write_index, good, write_index,
-                                        _mm512_set1_epi64(4));
+
+    _mm512_mask_i64scatter_epi64(write_base, write_good, write_index, syms, 1);
+    write_index = _mm512_add_epi64(write_index, write_len);
   }
   // Read the rest using scalar code. This means we need to convert the
   // vectorized state to more regular C++ variables.
