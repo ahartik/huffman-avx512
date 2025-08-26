@@ -15,6 +15,7 @@
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <type_traits>
 #include <vector>
 
 namespace huffman {
@@ -183,6 +184,32 @@ uint32_t read_u32(std::string_view& in) {
   return x;
 }
 
+template <typename Func>
+void ForallCodes(const uint8_t* len_count, const uint8_t* syms, int num_syms,
+                 Func func) {
+  int current_len = 0;
+  int current_len_count = 0;
+  uint32_t current_code = 0;
+  uint64_t current_inc = 1ull << kMaxCodeLength;
+  // std::cout << "num_syms: " << num_syms << "\n" << std::flush;
+  for (int i = 0; i < num_syms; ++i) {
+    while (len_count[current_len] == current_len_count) {
+      ++current_len;
+      current_len_count = 0;
+      current_inc >>= 1;
+    }
+
+    func(syms[i], BitCode{uint16_t(current_code), uint16_t(current_len)});
+
+    current_code += current_inc;
+    ++current_len_count;
+  }
+  // Should have exactly wrapped around:
+  if (num_syms != 0) {
+    assert(current_code == (1 << kMaxCodeLength));
+  }
+}
+
 struct CanonicalCoding {
   int sym_count[256] = {};
   BitCode codes[256] = {};
@@ -286,31 +313,12 @@ CanonicalCoding MakeCanonicalCoding(std::string_view text) {
     }
   }
 
-  int current_len = 0;
-  int current_len_count = 0;
-  uint32_t current_code = 0;
-  uint64_t current_inc = 1 << kMaxCodeLength;
-  for (int j = 0; j < coding.num_syms; ++j) {
-    uint8_t sym = coding.sorted_syms[j];
-    while (current_len_count == coding.len_count[current_len]) {
-      ++current_len;
-      current_inc >>= 1;
-      current_len_count = 0;
-    }
-    coding.codes[sym].len = current_len;
-    coding.codes[sym].bits = current_code;
+  ForallCodes(coding.len_count, coding.sorted_syms, coding.num_syms,
+              [&coding](uint8_t sym, BitCode code) {
+                coding.codes[sym] = code;
+                DLOG(1) << SymToStr(sym) << " -> " << code << "\n";
+              });
 
-    DLOG(1) << SymToStr(sym) << " -> " << coding.codes[sym] << "\n";
-
-    current_code += current_inc;
-    ++current_len_count;
-  }
-  // Code should wrap around perfectly once.
-#ifdef HUFF_DEBUG
-  std::cout << "compress: current_code at the end: " << current_code << "\n"
-            << std::flush;
-#endif
-  assert(current_code == (1ull << kMaxCodeLength));
   return coding;
 }
 
@@ -465,87 +473,56 @@ struct DecodedSym {
 
 class Decoder {
  public:
-  Decoder(uint8_t* len_count, const uint8_t* syms, int num_syms)
+  Decoder(const uint8_t* len_count, const uint8_t* syms, int num_syms)
       : dtable_((1 << kMaxCodeLength) + 4) {
-    // Note that this code also handles the strange case where there is only 1
-    // symbol in the compressed text, in which case that symbol is encoded
-    // using 0 bits.
-    int current_len = 0;
-    int current_len_count = 0;
-    uint32_t current_code = 0;
-    uint64_t current_inc = 1ull << kMaxCodeLength;
-    // std::cout << "num_syms: " << num_syms << "\n" << std::flush;
     DLOG(1) << "Decoder:\n";
-    for (int i = 0; i < num_syms; ++i) {
-      while (len_count[current_len] == current_len_count) {
-        max_code_for_len_[current_len] = current_code;
-        ++current_len;
-        current_len_count = 0;
-        current_inc >>= 1;
-      }
-
+    ForallCodes(len_count, syms, num_syms, [this](uint8_t sym, BitCode code) {
+      uint32_t inc = 1 << (kMaxCodeLength - code.len);
       DecodedSym dsym = {
-          .code_len = uint8_t(current_len),
-          .sym = syms[i],
+          .code_len = uint8_t(code.len),
+          .sym = sym,
       };
-      DLOG(1) << SymToStr(syms[i]) << " -> "
-              << BitCode(current_code, current_len) << "\n";
-      std::fill(dtable_.begin() + current_code,
-                dtable_.begin() + current_code + current_inc, dsym);
-
-      current_code += current_inc;
-      ++current_len_count;
-    }
-    for (int j = current_len; j <= 16; ++j) max_code_for_len_[j] = current_code;
-
-    for (int j = 0; j < 16; ++j) {
-      max_code_for_len_[j] -= 1;
-    }
-    // Should have exactly wrapped around:
-    if (num_syms != 0) {
-      assert(current_code == (1 << kMaxCodeLength));
-    }
-    max_code_vec_ =
-        _mm256_loadu_si256(reinterpret_cast<__m256i*>(max_code_for_len_));
+      std::fill(dtable_.begin() + code.bits, dtable_.begin() + code.bits + inc,
+                dsym);
+    });
   }
 
   // TODO: Two symbols at a time decoding.
 
-  inline int Decode(uint16_t code, uint8_t* out_sym,
-                    bool try_avx = false) const {
+  inline int Decode(uint16_t code, uint8_t* out_sym) const {
     DLOG(2) << std::format("Decode({:016B}) \n", code);
     DecodedSym dsym = dtable_[code];
 
     *out_sym = dsym.sym;
-    if (try_avx) {
-      // This is slow and should likely be removed.
-      // Kept here just in case we want to try this idea in AVX512 code in the
-      // future.
-      __m256i c_vec = _mm256_set1_epi16(code);
-      // This limits code length to max 15 bits, since comparison is signed.
-      __m256i gt_max = _mm256_cmpgt_epi16(c_vec, max_code_vec_);
-      // Now, length is the same as the count of 0xffff words in `gt_max`.
-      uint32_t gt_mask = _mm256_movemask_epi8(gt_max);
-      const int len = (CountBits(gt_mask) / 2);
-      if (HUFF_VLOG > 0 && len != dsym.code_len) {
-        DLOG(2) << "AVX FAIL: len=" << len
-                << " while dsym.code_len=" << int(dsym.code_len) << "\n";
-        DLOG(2) << std::format("gt_mask = {:016B}\n", gt_mask) << std::flush;
-        assert(false);
-      }
-      return len;
-    } else {
-      return dsym.code_len;
-    }
+    return dsym.code_len;
   }
 
   const DecodedSym* dtable() const { return dtable_.data(); }
 
  private:
   std::vector<DecodedSym> dtable_;
+};
 
-  int16_t max_code_for_len_[16] = {};
-  __m256i max_code_vec_;
+struct MultiDecodedSyms {
+  uint8_t code_len;
+  uint8_t syms[2];
+  uint8_t num_syms;
+};
+
+class MultiDecoder {
+ public:
+  MultiDecoder(const uint8_t* len_count, const uint8_t* syms, int num_syms)
+      : single_(len_count, syms, num_syms) {
+    //
+  }
+
+  // TODO: Two symbols at a time decoding.
+
+  const MultiDecodedSyms* dtable() const { return dtable_.data(); }
+
+ private:
+  const Decoder single_;
+  std::vector<MultiDecodedSyms> dtable_;
 };
 
 using BestDecoder = Decoder;
@@ -827,8 +804,7 @@ std::string DecompressMulti(std::string_view compressed) {
     for (int j = 0; j < 4; ++j) {
 #pragma GCC unroll 8
       for (int k = 0; k < K; ++k) {
-        int code_len = decoder.Decode(reader[k].code(), part_output[k]++,
-                                      /* try_avx= */ false);
+        int code_len = decoder.Decode(reader[k].code(), part_output[k]++);
         reader[k].ConsumeFast(code_len);
       }
     }
@@ -888,8 +864,8 @@ void DecodeSingleStream(const Decoder& decoder, const uint8_t* compressed_begin,
   }
 }
 
-template <int K>
-std::string DecompressMultiAvx512(std::string_view compressed) {
+template <int K, bool multi_table>
+std::string DecompressMultiAvx512Impl(std::string_view compressed) {
   static_assert(K % 8 == 0);
   constexpr int M = K / 8;
   const uint32_t raw_size = read_u32(compressed);
@@ -948,13 +924,10 @@ std::string DecompressMultiAvx512(std::string_view compressed) {
 
   using vec8x64 = __m512i;
 
-#define DEF_ARR(type, name, val)  \
-  type name[M];                   \
-  do {                            \
-    _Pragma("GCC unroll 8") \
-    for (int m = 0; m < M; ++m) { \
-      name[m] = (val);            \
-    }                             \
+#define DEF_ARR(type, name, val)                                             \
+  type name[M];                                                              \
+  do {                                                                       \
+    _Pragma("GCC unroll 8") for (int m = 0; m < M; ++m) { name[m] = (val); } \
   } while (0)
 
 #define DEF_VECS(name, val) DEF_ARR(vec8x64, name, val);
@@ -978,13 +951,11 @@ std::string DecompressMultiAvx512(std::string_view compressed) {
 
   auto some_good = [&good]() {
     uint32_t good_mask = 0;
-    FORM(m) {
-      good_mask |= _cvtmask8_u32(good[m]);
-    }
+    FORM(m) { good_mask |= _cvtmask8_u32(good[m]); }
     return good_mask != 0;
   };
 
-  // Each iteration decodes 4 bytes
+  // Each iteration decodes 0, 4, or 8 bytes for each stream.
   while (some_good()) {
     DEF_ARR(mask8, write_good,
             _mm512_cmplt_epi64_mask(write_v[m], write_limit_v[m]));
@@ -997,10 +968,11 @@ std::string DecompressMultiAvx512(std::string_view compressed) {
     for (int j = 0; j < 8; ++j) {
       if (j % 4 == 0) {
         // Fill buffer.
-        DEF_VECS(bytes_consumed, _mm512_srli_epi64(bits_consumed_v[m], 3));
         FORM(m) {
+          const vec8x64 bytes_consumed =
+              _mm512_srli_epi64(bits_consumed_v[m], 3);
           read_v[m] = _mm512_mask_sub_epi64(read_v[m], good[m], read_v[m],
-                                            bytes_consumed[m]);
+                                            bytes_consumed);
           // Remainder bits: bits_consumed = bits_consumed % 8;
           bits_consumed_v[m] =
               _mm512_mask_and_epi64(bits_consumed_v[m], good[m],
@@ -1022,13 +994,17 @@ std::string DecompressMultiAvx512(std::string_view compressed) {
         }
       }
 
-      DEF_VECS(index, _mm512_srli_epi64(bits[m], 64 - kMaxCodeLength));
+      // This expression is merged into below.
+      // DEF_VECS(index, _mm512_srli_epi64(bits[m], 64 - kMaxCodeLength));
+
       // Table has two bytes for each entry. We read 64 bits for each entry
       // due to two reasons:
       // 1. There is no instruction to "gather" only 2 bytes
       // 2. Keeping vector size at 512 bits is faster since no conversions are
       // required.
-      DEF_VECS(dsyms, _mm512_i64gather_epi64(index[m], dtable_base, 2));
+      DEF_VECS(dsyms, _mm512_i64gather_epi64(
+                          _mm512_srli_epi64(bits[m], 64 - kMaxCodeLength),
+                          dtable_base, 2));
       // Now, code length is stored in the lowest byte of each 64-bit word, and
       // the symbol in the second-lowest byte.
 
@@ -1067,6 +1043,11 @@ std::string DecompressMultiAvx512(std::string_view compressed) {
                        write_base + write_offset[k], write_base + write_end[k]);
   }
   return raw;
+}
+
+template <int K>
+std::string DecompressMultiAvx512(std::string_view compressed) {
+  return DecompressMultiAvx512Impl<K, false>(compressed);
 }
 
 template std::string CompressMulti<2>(std::string_view compressed);
