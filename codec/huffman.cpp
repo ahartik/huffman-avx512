@@ -318,8 +318,7 @@ class CodeWriter {
  public:
   explicit CodeWriter(char* begin, char* end) { Init(begin, end); }
 
-  CodeWriter() {
-  }
+  CodeWriter() {}
 
   void Init(char* begin, char* end) {
     begin_ = begin;
@@ -889,10 +888,10 @@ void DecodeSingleStream(const Decoder& decoder, const uint8_t* compressed_begin,
   }
 }
 
-std::string DecompressMulti8Avx512(std::string_view compressed) {
-  // TODO: this
-  // constexpr int M = 1; // Superscalar parallelism
-  constexpr int K = 8;  // SIMD parallelism
+template <int K>
+std::string DecompressMultiAvx512(std::string_view compressed) {
+  static_assert(K % 8 == 0);
+  constexpr int M = K / 8;
   const uint32_t raw_size = read_u32(compressed);
   const uint32_t len_mask = read_u32(compressed);
   uint8_t len_count[32] = {};
@@ -947,88 +946,119 @@ std::string DecompressMulti8Avx512(std::string_view compressed) {
     write_end[k] = write_offset[k] + sizes[k];
   }
 
-  // 8 indices for reading data
-  __m512i read_index = _mm512_loadu_epi64(read_offset);
-  __m512i write_index = _mm512_loadu_epi64(write_offset);
-
-  const __m512i read_begin = _mm512_loadu_epi64(read_begin_offset);
-  const __m512i write_limit =
-      _mm512_sub_epi64(_mm512_loadu_epi64(write_end), _mm512_set1_epi64(7));
-
-  // 8 integers for how many bits of the current word are already consumed.
-  __m512i bits_consumed = _mm512_setzero_si512();
-  const __m512i table_mask = _mm512_set1_epi64((1 << kMaxCodeLength) - 1);
-  const __m512i zero_v = _mm512_setzero_si512();
-
   using vec8x64 = __m512i;
 
-  __mmask8 good = _mm512_cmplt_epi64_mask(write_index, write_limit);
+#define DEF_ARR(type, name, val)  \
+  type name[M];                   \
+  do {                            \
+    for (int m = 0; m < M; ++m) { \
+      name[m] = (val);            \
+    }                             \
+  } while (0)
+
+#define DEF_VECS(name, val) DEF_ARR(vec8x64, name, val);
+
+#define FORM(m) for (int m = 0; m < M; ++m)
+
+  // 8 indices for reading data
+  const vec8x64 zero_v = _mm512_setzero_si512();
+  DEF_VECS(read_v, _mm512_loadu_epi64(read_offset + m * 8));
+  DEF_VECS(write_v, _mm512_loadu_epi64(write_offset + m * 8));
+  DEF_VECS(read_begin_v, _mm512_loadu_epi64(read_begin_offset + m * 8));
+  DEF_VECS(write_limit_v,
+           _mm512_sub_epi64(_mm512_loadu_epi64(write_end + m * 8),
+                            _mm512_set1_epi64(7)));
+
+  DEF_ARR(vec8x64, bits_consumed_v, zero_v);
+
+  using mask8 = __mmask8;
+
+  DEF_ARR(mask8, good, _mm512_cmplt_epi64_mask(write_v[m], write_limit_v[m]));
+
+  auto some_good = [&good]() {
+    uint32_t good_mask = 0;
+#pragma GCC unroll 8
+    for (int m = 0; m < M; ++m) {
+      good_mask |= _cvtmask8_u32(good[m]);
+    }
+    return good_mask != 0;
+  };
 
   // Each iteration decodes 4 bytes
-  while (_cvtmask8_u32(good) != 0) {
-    __mmask8 write_good = _mm512_cmplt_epi64_mask(write_index, write_limit);
-    good = _kand_mask8(good, write_good);
-    // Skip forward:
-    // bytes_consumed = bits_consumed / 8;
+  while (some_good()) {
+    DEF_ARR(mask8, write_good,
+            _mm512_cmplt_epi64_mask(write_v[m], write_limit_v[m]));
+    FORM(m) good[m] = _kand_mask8(good[m], write_good[m]);
 
-    __m512i write_len = _mm512_set1_epi64(0);
-    __m512i syms = zero_v;
-    __m512i bits = zero_v;
+    DEF_VECS(write_len, zero_v);
+    DEF_VECS(syms, zero_v);
+    DEF_VECS(bits, zero_v);
 #pragma GCC unroll 8
     for (int j = 0; j < 8; ++j) {
       if (j % 4 == 0) {
         // Fill buffer.
-        __m512i bytes_consumed = _mm512_srli_epi64(bits_consumed, 3);
-        read_index =
-            _mm512_mask_sub_epi64(read_index, good, read_index, bytes_consumed);
-        // Remainder bits: bits_consumed = bits_consumed % 8;
-        bits_consumed = _mm512_mask_and_epi64(bits_consumed, good, bits_consumed,
-                                              _mm512_set1_epi64(7));
-        // Check that we can continue:
-        good = _kand_mask8(good, _mm512_cmpge_epi64_mask(read_index, read_begin));
-        // Read the bits to decompress
-        bits =
-            _mm512_mask_i64gather_epi64(zero_v, good, read_index, read_base, 1);
-        // Move the code to be read to the highest bits of each int64.
-        // code = (bits << bits_consumed) >> (64 - kMaxCodeLength).
-        bits = _mm512_sllv_epi64(bits, bits_consumed);
-        // We always write 8 bytes, but some of them may be garbage
-        // TODO: It might be faster to just skip writes altogether instead of
-        // sometimes advancing the write index by 4 bytes only.
-        write_len = _mm512_mask_add_epi64(
-            write_len, good, write_len,
-            _mm512_set1_epi64(4));
+        DEF_VECS(bytes_consumed, _mm512_srli_epi64(bits_consumed_v[m], 3));
+        for (int m = 0; m < M; ++m) {
+          read_v[m] = _mm512_mask_sub_epi64(read_v[m], good[m], read_v[m],
+                                            bytes_consumed[m]);
+          // Remainder bits: bits_consumed = bits_consumed % 8;
+          bits_consumed_v[m] =
+              _mm512_mask_and_epi64(bits_consumed_v[m], good[m],
+                                    bits_consumed_v[m], _mm512_set1_epi64(7));
+          // Check that we can continue:
+          good[m] = _kand_mask8(
+              good[m], _mm512_cmpge_epi64_mask(read_v[m], read_begin_v[m]));
+          // Read the bits to decompress
+          bits[m] = _mm512_mask_i64gather_epi64(zero_v, good[m], read_v[m],
+                                                read_base, 1);
+          // Move the code to be read to the highest bits of each int64.
+          // code = (bits << bits_consumed) >> (64 - kMaxCodeLength).
+          bits[m] = _mm512_sllv_epi64(bits[m], bits_consumed_v[m]);
+          // We always write 8 bytes, but some of them may be garbage
+          // TODO: It might be faster to just skip writes altogether instead of
+          // sometimes advancing the write index by 4 bytes only.
+          write_len[m] = _mm512_mask_add_epi64(
+              write_len[m], good[m], write_len[m], _mm512_set1_epi64(4));
+        }
       }
 
-      __m512i index = _mm512_srli_epi64(bits, 64 - kMaxCodeLength);
+      DEF_VECS(index, _mm512_srli_epi64(bits[m], 64 - kMaxCodeLength));
       // Table has two bytes for each entry. We read 64 bits for each entry
       // due to two reasons:
       // 1. There is no instruction to "gather" only 2 bytes
       // 2. Keeping vector size at 512 bits is faster since no conversions are
       // required.
-      __m512i dsyms = _mm512_i64gather_epi64(index, dtable_base, 2);
+      DEF_VECS(dsyms, _mm512_i64gather_epi64(index[m], dtable_base, 2));
       // Now, code length is stored in the lowest byte of each 64-bit word, and
       // the symbol in the second-lowest byte.
 
-      __m512i this_sym = _mm512_and_epi64(_mm512_srli_epi64(dsyms, 8),
-                                          _mm512_set1_epi64(0xff));
-      syms = _mm512_or_epi64(syms, _mm512_slli_epi64(this_sym, j * 8));
-      __m512i code_len = _mm512_and_epi64(dsyms, _mm512_set1_epi64(0xff));
-      // Consume bits
-      bits = _mm512_sllv_epi64(bits, code_len);
-      bits_consumed =
-          _mm512_mask_add_epi64(bits_consumed, good, bits_consumed, code_len);
+      for (int m = 0; m < M; ++m) {
+        vec8x64 this_sym = _mm512_and_epi64(_mm512_srli_epi64(dsyms[m], 8),
+                                            _mm512_set1_epi64(0xff));
+        // Store decoded symbols in `syms`.
+        syms[m] = _mm512_or_epi64(syms[m], _mm512_slli_epi64(this_sym, j * 8));
+        __m512i code_len = _mm512_and_epi64(dsyms[m], _mm512_set1_epi64(0xff));
+        // Consume bits
+        bits[m] = _mm512_sllv_epi64(bits[m], code_len);
+        bits_consumed_v[m] = _mm512_mask_add_epi64(
+            bits_consumed_v[m], good[m], bits_consumed_v[m], code_len);
+      }
     }
 
-    _mm512_mask_i64scatter_epi64(write_base, write_good, write_index, syms, 1);
-    write_index = _mm512_add_epi64(write_index, write_len);
+    for (int m = 0; m < M; ++m) {
+      _mm512_mask_i64scatter_epi64(write_base, write_good[m], write_v[m],
+                                   syms[m], 1);
+      write_v[m] = _mm512_add_epi64(write_v[m], write_len[m]);
+    }
   }
   // Read the rest using scalar code. This means we need to convert the
   // vectorized state to more regular C++ variables.
   uint64_t bit_offset[K];
-  _mm512_storeu_epi64(write_offset, write_index);
-  _mm512_storeu_epi64(read_offset, read_index);
-  _mm512_storeu_epi64(bit_offset, bits_consumed);
+  for (int m = 0; m < M; ++m) {
+    _mm512_storeu_epi64(write_offset + m * 8, write_v[m]);
+    _mm512_storeu_epi64(read_offset + m * 8, read_v[m]);
+    _mm512_storeu_epi64(bit_offset + m * 8, bits_consumed_v[m]);
+  }
 
   // Decode 1 byte at a time:
   for (int k = 0; k < K; ++k) {
@@ -1049,4 +1079,13 @@ template std::string DecompressMulti<4>(std::string_view compressed);
 template std::string CompressMulti<8>(std::string_view compressed);
 template std::string DecompressMulti<8>(std::string_view compressed);
 
+template std::string CompressMulti<32>(std::string_view compressed);
+template std::string DecompressMulti<32>(std::string_view compressed);
+
+template std::string CompressMulti<16>(std::string_view compressed);
+template std::string DecompressMulti<16>(std::string_view compressed);
+
+template std::string DecompressMultiAvx512<8>(std::string_view compressed);
+template std::string DecompressMultiAvx512<16>(std::string_view compressed);
+template std::string DecompressMultiAvx512<32>(std::string_view compressed);
 }  // namespace huffman
