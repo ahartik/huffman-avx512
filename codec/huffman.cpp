@@ -951,6 +951,7 @@ std::string DecompressMultiAvx512(std::string_view compressed) {
 #define DEF_ARR(type, name, val)  \
   type name[M];                   \
   do {                            \
+    _Pragma("GCC unroll 8") \
     for (int m = 0; m < M; ++m) { \
       name[m] = (val);            \
     }                             \
@@ -958,7 +959,7 @@ std::string DecompressMultiAvx512(std::string_view compressed) {
 
 #define DEF_VECS(name, val) DEF_ARR(vec8x64, name, val);
 
-#define FORM(m) for (int m = 0; m < M; ++m)
+#define FORM(m) _Pragma("GCC unroll 8") for (int m = 0; m < M; ++m)
 
   // 8 indices for reading data
   const vec8x64 zero_v = _mm512_setzero_si512();
@@ -977,8 +978,7 @@ std::string DecompressMultiAvx512(std::string_view compressed) {
 
   auto some_good = [&good]() {
     uint32_t good_mask = 0;
-#pragma GCC unroll 8
-    for (int m = 0; m < M; ++m) {
+    FORM(m) {
       good_mask |= _cvtmask8_u32(good[m]);
     }
     return good_mask != 0;
@@ -998,7 +998,7 @@ std::string DecompressMultiAvx512(std::string_view compressed) {
       if (j % 4 == 0) {
         // Fill buffer.
         DEF_VECS(bytes_consumed, _mm512_srli_epi64(bits_consumed_v[m], 3));
-        for (int m = 0; m < M; ++m) {
+        FORM(m) {
           read_v[m] = _mm512_mask_sub_epi64(read_v[m], good[m], read_v[m],
                                             bytes_consumed[m]);
           // Remainder bits: bits_consumed = bits_consumed % 8;
@@ -1032,7 +1032,7 @@ std::string DecompressMultiAvx512(std::string_view compressed) {
       // Now, code length is stored in the lowest byte of each 64-bit word, and
       // the symbol in the second-lowest byte.
 
-      for (int m = 0; m < M; ++m) {
+      FORM(m) {
         vec8x64 this_sym = _mm512_and_epi64(_mm512_srli_epi64(dsyms[m], 8),
                                             _mm512_set1_epi64(0xff));
         // Store decoded symbols in `syms`.
@@ -1045,7 +1045,7 @@ std::string DecompressMultiAvx512(std::string_view compressed) {
       }
     }
 
-    for (int m = 0; m < M; ++m) {
+    FORM(m) {
       _mm512_mask_i64scatter_epi64(write_base, write_good[m], write_v[m],
                                    syms[m], 1);
       write_v[m] = _mm512_add_epi64(write_v[m], write_len[m]);
