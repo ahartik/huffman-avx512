@@ -26,7 +26,6 @@ cc_test(
 cc_binary(
   name = "huffman_benchmark",
   srcs = ["huffman_benchmark.cpp"],
-  linkopts = ['-lprofiler'],
   deps = [
     ":huffman",
     ":huff0",

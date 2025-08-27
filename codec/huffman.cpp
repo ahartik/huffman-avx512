@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include <array>
 #include <algorithm>
 #include <bit>
 #include <format>
@@ -219,7 +220,6 @@ void ForallCodes(const uint8_t* len_count, const uint8_t* syms, int num_syms,
 }
 
 struct CanonicalCoding {
-  int sym_count[256] = {};
   BitCode codes[256] = {};
   uint8_t sorted_syms[256] = {};
   int num_syms = 0;
@@ -262,25 +262,26 @@ void LimitCodeLengths(uint8_t* len_count) {
   }
 }
 
-CanonicalCoding MakeCanonicalCoding(std::string_view text) {
+
+CanonicalCoding MakeCanonicalCoding(int* sym_count) {
   CanonicalCoding coding;
-  if (text.empty()) {
-    return coding;
-  }
-  CountSymbols(text, coding.sym_count);
 
   std::vector<Node> heap;
   std::vector<Node> tree;
   heap.reserve(256);
+  // TODO: This too could be optimized, perhaps even using AVX.
   for (int c = 0; c < 256; ++c) {
-    if (coding.sym_count[c] != 0) {
+    if (sym_count[c] != 0) {
       Node node;
-      node.count = coding.sym_count[c];
+      node.count = sym_count[c];
       node.sym = uint8_t(c);
       heap.push_back(node);
       coding.sorted_syms[coding.num_syms] = node.sym;
       ++coding.num_syms;
     }
+  }
+  if (coding.num_syms == 0) {
+    return coding;
   }
 
   tree.reserve(heap.size());
@@ -310,7 +311,7 @@ CanonicalCoding MakeCanonicalCoding(std::string_view text) {
   // Sort the symbols in decreasing order of frequency.
   std::sort(coding.sorted_syms, coding.sorted_syms + coding.num_syms,
             [&](uint8_t a, uint8_t b) {
-              return coding.sym_count[a] > coding.sym_count[b];
+              return sym_count[a] > sym_count[b];
             });
 
   LimitCodeLengths(coding.len_count);
@@ -596,12 +597,14 @@ class Decoder2x{
 }  // namespace
 
 std::string Compress(std::string_view raw) {
-  CanonicalCoding coding = MakeCanonicalCoding(raw);
+  int sym_count[256] = {};
+  CountSymbols(raw, sym_count);
+  CanonicalCoding coding = MakeCanonicalCoding(sym_count);
 
   uint64_t output_bits = 0;
   for (int i = 0; i < coding.num_syms; ++i) {
     uint8_t sym = coding.sorted_syms[i];
-    output_bits += coding.codes[sym].len * coding.sym_count[sym];
+    output_bits += coding.codes[sym].len * sym_count[sym];
   }
 
   std::string compressed;
@@ -705,8 +708,6 @@ std::string Decompress(std::string_view compressed) {
 
 template <int K>
 std::string CompressMulti(std::string_view raw) {
-  CanonicalCoding coding = MakeCanonicalCoding(raw);
-
   int sizes[K] = {};
   for (int i = 0; i < K; ++i) {
     sizes[i] = raw.size() / K;
@@ -724,6 +725,34 @@ std::string CompressMulti(std::string_view raw) {
   for (int i = 0; i < K; ++i) {
     part_end[i] = part_input[i] + sizes[i];
   }
+
+  // Count symbols in each component.
+  // (I think this performs "value-initialization" on std::array elements,
+  // which means the counts are set to zero.)
+  std::vector<std::array<int, 256>> part_count(K);
+  assert(part_count[0][7] == 0);
+  int sym_count[256] = {};
+  {
+    int j[K] = {};
+    while (j[K-1] < sizes[K-1]) {
+      UNROLL8 for (int k = 0; k < K; ++k) {
+        ++part_count[k][part_input[k][j[k]]];
+        ++j[k];
+      }
+    }
+    for (int k = 0; k < K; ++k) {
+      for (int i = j[k]; i < sizes[k]; ++i) {
+        ++part_count[k][part_input[k][i]];
+      }
+    }
+    for (int k = 0; k < K; ++k) {
+      for (int i = 0; i < 256; ++i) {
+        sym_count[i] += part_count[k][i];
+      }
+    }
+  }
+  // CountSymbols(raw, sym_count);
+  CanonicalCoding coding = MakeCanonicalCoding(sym_count);
 
   const int kSlop = 8;
   // Compute starting positions for each part in the output.
@@ -950,11 +979,17 @@ void DecodeSingleStream(const UsedDecoder& decoder,
 bool VecEqual(__m512i a, __m512i b) {
   __mmask8 k = _mm512_cmpeq_epi64_mask(a, b);
   uint32_t mask_i = _cvtmask8_u32(k);
-  std::cout << "mask_i = " << mask_i << "\n";
+  // std::cout << "mask_i = " << mask_i << "\n";
   return mask_i == 0xff;
 }
 
-template <int K, bool multi_table>
+template <int K>
+std::string CompressMultiAvx512(std::string_view raw) {
+  // Perform counting using AVX too.
+}
+
+
+template <int K, typename UsedDecoder>
 std::string DecompressMultiAvx512Impl(std::string_view compressed) {
   static_assert(K % 8 == 0);
   constexpr int M = K / 8;
@@ -970,8 +1005,7 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
     }
   }
 
-  // Use bit lengths instead in the decoder table.
-  Decoder2x decoder(
+  UsedDecoder decoder(
       len_count, reinterpret_cast<const uint8_t*>(&compressed[0]), num_syms);
   compressed.remove_prefix(num_syms);
 
@@ -1158,7 +1192,7 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
           bits_consumed_v[m] = _mm512_mask_add_epi64(
               bits_consumed_v[m], good[m], bits_consumed_v[m], code_len);
           write_len[m] = _mm512_mask_add_epi64(
-              write_len[m], good[m], write_len[m], _mm512_set1_epi64(4));
+              write_len[m], good[m], write_len[m], _mm512_set1_epi64(1));
         }
       }
     }
@@ -1170,7 +1204,7 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
     }
   }
   // Read the rest using scalar code. This means we need to convert the
-  // vectorized state to more regular C++ variables.
+  // vectorized state to regular C++ variables.
   uint64_t bit_offset[K];
   for (int m = 0; m < M; ++m) {
     _mm512_storeu_epi64(write_offset + m * 8, write_v[m]);
@@ -1189,23 +1223,23 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
 
 template <int K>
 std::string DecompressMultiAvx512(std::string_view compressed) {
-  return DecompressMultiAvx512Impl<K, false>(compressed);
+  return DecompressMultiAvx512Impl<K, Decoder2x>(compressed);
 }
 
-template std::string CompressMulti<2>(std::string_view compressed);
+template std::string CompressMulti<2>(std::string_view raw);
 template std::string DecompressMulti<2>(std::string_view compressed);
-template std::string CompressMulti<3>(std::string_view compressed);
+template std::string CompressMulti<3>(std::string_view raw);
 template std::string DecompressMulti<3>(std::string_view compressed);
-template std::string CompressMulti<4>(std::string_view compressed);
+template std::string CompressMulti<4>(std::string_view raw);
 template std::string DecompressMulti<4>(std::string_view compressed);
 
-template std::string CompressMulti<8>(std::string_view compressed);
+template std::string CompressMulti<8>(std::string_view raw);
 template std::string DecompressMulti<8>(std::string_view compressed);
 
-template std::string CompressMulti<32>(std::string_view compressed);
+template std::string CompressMulti<32>(std::string_view raw);
 template std::string DecompressMulti<32>(std::string_view compressed);
 
-template std::string CompressMulti<16>(std::string_view compressed);
+template std::string CompressMulti<16>(std::string_view raw);
 template std::string DecompressMulti<16>(std::string_view compressed);
 
 template std::string DecompressMultiAvx512<8>(std::string_view compressed);
