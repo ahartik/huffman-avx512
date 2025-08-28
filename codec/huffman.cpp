@@ -622,9 +622,10 @@ std::string Compress(std::string_view raw) {
 
   // This pragma showed a 2% speedup once.
   // UNROLL8
-    while (input + 3 < end) {
+#pragma GCC unroll 4
+  while (input + 3 < end) {
     // We can write multiple codes for each flush.
-    
+
     UNROLL8 for (int j = 0; j < 4; ++j) {
       BitCode a = coding.codes[*input++];
       writer.WriteFast(a);
@@ -720,17 +721,10 @@ std::string CompressMulti(std::string_view raw) {
   assert(part_count[0][7] == 0);
   int sym_count[256] = {};
   {
-    int j[K] = {};
-    UNROLL8 while (j[K - 1] < sizes[K - 1]) {
-      UNROLL8 for (int k = 0; k < K; ++k) {
-        ++part_count[k][part_input[k][j[k]]];
-        ++j[k];
-      }
-    }
     for (int k = 0; k < K; ++k) {
-      for (int i = j[k]; i < sizes[k]; ++i) {
-        ++part_count[k][part_input[k][i]];
-      }
+      CountSymbols(std::string_view(
+                       reinterpret_cast<const char*>(part_input[k]), sizes[k]),
+                   part_count[k].data());
     }
     for (int k = 0; k < K; ++k) {
       for (int i = 0; i < 256; ++i) {
@@ -751,13 +745,6 @@ std::string CompressMulti(std::string_view raw) {
       for (int c = 0; c < 256; ++c) {
         num_bits += part_count[part][c] * coding.codes[c].len;
       }
-#ifndef NDEBUG
-      int64_t num_bits_check = 0;
-      for (int i = 0; i < sizes[part]; ++i) {
-        num_bits_check += coding.codes[uint8_t(raw[pos + i])].len;
-      }
-      assert(num_bits == num_bits_check);
-#endif
       pos += sizes[part];
       end_offset[part] = (num_bits + 7) / 8 + kSlop;
     }
@@ -810,14 +797,15 @@ std::string CompressMulti(std::string_view raw) {
   }
 
 #if 1
-  while (part_input[K - 1] + 3 < part_end[K - 1]) {
-    UNROLL8 for (int k = 0; k < K; ++k) {
+  // It's slightly strange, but ordering these loops like this is faster.
+  // Other way around gets better instruction parallelism, but also has more
+  // instructions so ends up slower.
+  for (int k = 0; k < K; ++k) {
+    while (part_input[k] + 3 < part_end[k]) {
       writer[k].Flush();
-    }
-    // We can write three codes of up to 14 bits per each flush.
-    static_assert(kMaxCodeLength <= 14);
-    UNROLL8 for (int j = 0; j < 4; ++j) {
-      UNROLL8 for (int k = 0; k < K; ++k) {
+      // We can write three codes of up to 14 bits per each flush.
+      static_assert(kMaxCodeLength <= 14);
+      UNROLL8 for (int j = 0; j < 4; ++j) {
         BitCode a = coding.codes[*part_input[k]++];
         writer[k].WriteFast(a);
       }
