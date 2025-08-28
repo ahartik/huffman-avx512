@@ -9,12 +9,13 @@
 #include <cstdint>
 #include <cstring>
 
-#include <array>
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <format>
 #include <iostream>
 #include <memory>
+#include <new>
 #include <sstream>
 #include <type_traits>
 #include <vector>
@@ -25,7 +26,7 @@ namespace {
 
 // Maximum code length we want to use.  Shorter max code lengths makes for
 // faster compression and decompression.
-const int kMaxCodeLength = 13;
+const int kMaxCodeLength = 12;
 const uint32_t kMaxCodeMask = (1 << kMaxCodeLength) - 1;
 // Maximum code length that would be optimal in terms of compression.  We use
 // shorter codes with slightly worse compression to gain better performance.
@@ -262,7 +263,6 @@ void LimitCodeLengths(uint8_t* len_count) {
   }
 }
 
-
 CanonicalCoding MakeCanonicalCoding(int* sym_count) {
   CanonicalCoding coding;
 
@@ -310,9 +310,7 @@ CanonicalCoding MakeCanonicalCoding(int* sym_count) {
 
   // Sort the symbols in decreasing order of frequency.
   std::sort(coding.sorted_syms, coding.sorted_syms + coding.num_syms,
-            [&](uint8_t a, uint8_t b) {
-              return sym_count[a] > sym_count[b];
-            });
+            [&](uint8_t a, uint8_t b) { return sym_count[a] > sym_count[b]; });
 
   LimitCodeLengths(coding.len_count);
 
@@ -527,10 +525,12 @@ struct DecodedSym2x {
   uint8_t num_syms;
 };
 
-class Decoder2x{
+class Decoder2x {
  public:
   Decoder2x(const uint8_t* len_count, const uint8_t* syms, int num_syms)
-      : single_(len_count, syms, num_syms), dtable_((1 << kMaxCodeLength) + 4) {
+      : single_(len_count, syms, num_syms),
+        dtable_(new  // (std::align_val_t(64))
+                DecodedSym2x[(1 << kMaxCodeLength) + 4]) {
     ForallCodes(len_count, syms, num_syms, [&](uint8_t sym1, BitCode code1) {
       // Iterate over all codes that are short enough that they can be combined
       // with code1.
@@ -565,7 +565,8 @@ class Decoder2x{
       msym.num_syms = 1;
       uint32_t inc = 1 << (kMaxCodeLength - code1.len);
       for (uint32_t j = last_code; j < code1.bits + inc; ++j) dtable_[j] = msym;
-      // std::fill(dtable_.data() + last_code, dtable_.data() + code1.bits + inc,
+      // std::fill(dtable_.data() + last_code, dtable_.data() + code1.bits +
+      // inc,
       //           msym);
       return true;
     });
@@ -583,7 +584,7 @@ class Decoder2x{
     return single_.Decode(code, out_sym);
   }
 
-  const DecodedSym2x* dtable() const { return dtable_.data(); }
+  const DecodedSym2x* dtable() const { return dtable_.get(); }
 
   int max_symbols_decoded() const { return 2; }
 
@@ -591,7 +592,8 @@ class Decoder2x{
 
  private:
   Decoder1x single_;
-  std::vector<DecodedSym2x> dtable_;
+  // std::vector<DecodedSym2x> dtable_;
+  std::unique_ptr<DecodedSym2x[]> dtable_;
 };
 
 }  // namespace
@@ -734,7 +736,7 @@ std::string CompressMulti(std::string_view raw) {
   int sym_count[256] = {};
   {
     int j[K] = {};
-    while (j[K-1] < sizes[K-1]) {
+    while (j[K - 1] < sizes[K - 1]) {
       UNROLL8 for (int k = 0; k < K; ++k) {
         ++part_count[k][part_input[k][j[k]]];
         ++j[k];
@@ -987,7 +989,6 @@ template <int K>
 std::string CompressMultiAvx512(std::string_view raw) {
   // Perform counting using AVX too.
 }
-
 
 template <int K, typename UsedDecoder>
 std::string DecompressMultiAvx512Impl(std::string_view compressed) {

@@ -1,9 +1,13 @@
 #include "codec/huffman.h"
 #include "codec/huff0.h"
 
+#include <iostream>
+
 #include <cstdint>
 #include <cstdlib>
+
 #include <string>
+#include <random>
 
 #include "benchmark/benchmark.h"
 
@@ -125,23 +129,27 @@ void BM_CompressLong(benchmark::State& state) {
 
 template <typename Compressor>
 void BM_DecompressLong(benchmark::State& state) {
-  srand(0);
+  // std::cout << "BM_DecompressLong\n";
+  std::mt19937 mt;
   std::string raw;
   int len = 100000;
 
   for (int i = 0; i < len; ++i) {
-    raw.push_back(uint8_t(rand() & rand() & rand()));
+    raw.push_back(uint8_t(mt() & mt() & mt()));
   }
 
   std::string compressed = Compressor::Compress(raw);
+  int64_t total_raw = 0;
   for (auto _ : state) {
     std::string decompressed = Compressor::Decompress(compressed);
+    total_raw += decompressed.size();
   }
-  state.SetBytesProcessed(state.iterations() * len);
+  state.SetBytesProcessed(total_raw);
 
   double ratio = double(compressed.size()) / raw.size();
   state.counters["ratio"] = ratio;
 }
+
 }  // namespace
 
 #define DEFINE_BENCHMARKS(TYPE)          \
@@ -155,7 +163,7 @@ void BM_DecompressLong(benchmark::State& state) {
   BENCHMARK(BM_DecompressLong<TYPE>);
 
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressor)
-// DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<2>)
+DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<2>)
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<4>)
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<8>)
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvx<8>)

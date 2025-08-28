@@ -55,6 +55,10 @@ class HuffmanCompressorAvx {
   static std::string Decompress(std::string_view compressed) {
     return DecompressMultiAvx512<K>(compressed);
   }
+
+  static std::string DecompressInto(std::string_view compressed) {
+    return DecompressMultiAvx512<K>(compressed);
+  }
   static std::string name() {
     return std::format("HuffmanAvx<{}>", K);
   }
