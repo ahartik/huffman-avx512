@@ -156,7 +156,7 @@ void BM_DecompressLong(benchmark::State& state) {
   BENCHMARK(BM_CompressBiased<TYPE>);    \
   BENCHMARK(BM_CompressUniform<TYPE>);   \
   BENCHMARK(BM_CompressShort<TYPE>);     \
-  BENCHMARK(BM_CompressLong<TYPE>);      \
+  BENCHMARK(BM_CompressLong<TYPE>)->Iterations(20000);      \
   BENCHMARK(BM_DecompressBiased<TYPE>);  \
   BENCHMARK(BM_DecompressUniform<TYPE>); \
   BENCHMARK(BM_DecompressShort<TYPE>);   \

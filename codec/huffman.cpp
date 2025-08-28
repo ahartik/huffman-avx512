@@ -59,20 +59,17 @@ void CountSymbols(std::string_view text, int* sym_count) {
     const size_t text_size = text.size();
     const uint8_t* ptr = reinterpret_cast<const uint8_t*>(text.data());
     const uint8_t* end = ptr + text_size;
-    // TODO: This complexity is not worth it, make microbenchmarks and simplify
-    // possibly.
-    while (ptr + 7 < end) {
-      uint64_t data;
-      memcpy(&data, ptr, 8);
-      ptr += 8;
+    // Unrolling here is a very very small improvement
+#pragma GCC unroll 4
+    while (ptr + 3 < end) {
+      // Four bytes at a time is slightly faster than 8.
+      uint32_t data;
+      memcpy(&data, ptr, 4);
+      ptr += 4;
       ++tmp_count[0][data & 0xff];
       ++tmp_count[1][(data >> 8) & 0xff];
       ++tmp_count[2][(data >> 16) & 0xff];
       ++tmp_count[3][(data >> 24) & 0xff];
-      ++tmp_count[0][(data >> 32) & 0xff];
-      ++tmp_count[1][(data >> 40) & 0xff];
-      ++tmp_count[2][(data >> 48) & 0xff];
-      ++tmp_count[3][(data >> 56) & 0xff];
     }
     while (ptr < end) {
       ++tmp_count[0][*ptr++];
@@ -132,7 +129,7 @@ inline uint16_t ReverseBits16(uint16_t x) {
 struct BitCode {
   uint16_t bits;
   // uint16_t mask;
-  int16_t len;
+  uint16_t len;
   // int16_t pad;
   //
 };
@@ -194,28 +191,25 @@ uint32_t read_u32(std::string_view& in) {
 template <typename Func>
 void ForallCodes(const uint8_t* len_count, const uint8_t* syms, int num_syms,
                  Func func) {
-  int current_len = 0;
-  int current_len_count = 0;
   uint32_t current_code = 0;
   uint64_t current_inc = 1ull << kMaxCodeLength;
   bool aborted = false;
-  for (int i = 0; i < num_syms; ++i) {
-    while (len_count[current_len] == current_len_count) {
-      ++current_len;
-      current_len_count = 0;
-      current_inc >>= 1;
-    }
 
-    if (!func(syms[i], BitCode{uint16_t(current_code), int16_t(current_len)})) {
-      aborted = true;
-      break;
+  int i = 0;
+  for (int len = 0; (len <= kMaxCodeLength) && !aborted; ++len) {
+    for (int j = 0; j < len_count[len]; ++j) {
+      if (!func(syms[i], BitCode{uint16_t(current_code), uint16_t(len)})) {
+        aborted = true;
+        break;
+      }
+      ++i;
+      current_code += current_inc;
     }
-
-    current_code += current_inc;
-    ++current_len_count;
+    current_inc >>= 1;
   }
   // Should have exactly wrapped around:
   if (num_syms != 0 && !aborted) {
+    assert(i == num_syms);
     assert(current_code == (1 << kMaxCodeLength));
   }
 }
@@ -353,7 +347,7 @@ class CodeWriter {
     DLOG(2) << std::format("Flush(): buf_ = {:016x} buf_size_= {}\n", buf_,
                            buf_size_);
     assert(output_ >= begin_);
-    int num_bytes = buf_size_ >> 3;
+    uint32_t num_bytes = buf_size_ >> 3;
     assert(num_bytes <= 8);
     // This assumes little endian:
     memcpy(output_, &buf_, 8);
@@ -375,11 +369,11 @@ class CodeWriter {
 
   void Finish() {
     char* out_byte = output_ + 7;
-    while (buf_size_ > 0) {
+    const int bytes_left = (buf_size_ + 7) / 8;
+    for (int j = 0; j < bytes_left; ++j) {
       uint8_t top = (buf_ >> 56) & 0xff;
       *out_byte-- = top;
       buf_ <<= 8;
-      buf_size_ -= 8;
     }
   }
 
@@ -388,7 +382,7 @@ class CodeWriter {
   char* end_;
   char* output_;
   uint64_t buf_;
-  int buf_size_;
+  uint64_t buf_size_;
 };
 
 class CodeReader {
@@ -519,7 +513,7 @@ class Decoder1x {
   std::vector<DecodedSym> dtable_;
 };
 
-struct DecodedSym2x {
+struct alignas(4) DecodedSym2x {
   uint8_t num_bits_decoded;
   uint8_t syms[2];
   uint8_t num_syms;
@@ -545,15 +539,11 @@ class Decoder2x {
         msym.syms[0] = sym1;
         msym.syms[1] = sym2;
         msym.num_syms = 2;
-        const uint32_t code = code1.bits | (code2.bits >> (code1.len));
+        const uint32_t code =
+            code1.bits | (uint32_t(code2.bits) >> uint32_t(code1.len));
         const uint32_t inc = 1 << (kMaxCodeLength - code1.len - code2.len);
-        // This is a micro-optimization: std::fill is slower here for some
-        // reason than a simple loop.
-        //
-        // std::fill(dtable_.data() + code, dtable_.data() + code + inc, msym);
-        for (uint32_t j = code; j < code + inc; ++j) {
-          dtable_[j] = msym;
-        }
+
+        std::fill(dtable_.get() + code, dtable_.get() + code + inc, msym);
         last_code = code + inc;
         return true;
       });
@@ -564,10 +554,8 @@ class Decoder2x {
       msym.syms[1] = 0;
       msym.num_syms = 1;
       uint32_t inc = 1 << (kMaxCodeLength - code1.len);
-      for (uint32_t j = last_code; j < code1.bits + inc; ++j) dtable_[j] = msym;
-      // std::fill(dtable_.data() + last_code, dtable_.data() + code1.bits +
-      // inc,
-      //           msym);
+      std::fill(dtable_.get() + last_code, dtable_.get() + code1.bits + inc,
+                msym);
       return true;
     });
   }
@@ -592,7 +580,6 @@ class Decoder2x {
 
  private:
   Decoder1x single_;
-  // std::vector<DecodedSym2x> dtable_;
   std::unique_ptr<DecodedSym2x[]> dtable_;
 };
 
@@ -634,16 +621,14 @@ std::string Compress(std::string_view raw) {
   const uint8_t* end = input + raw.size();
 
   // This pragma showed a 2% speedup once.
-#pragma GCC unroll 1
-  while (input + 2 < end) {
-    // We can write three codes of up to 16 bits per each flush.
-    BitCode a = coding.codes[*input++];
-    BitCode b = coding.codes[*input++];
-    BitCode c = coding.codes[*input++];
-    // BitCode d = coding.codes[*input++];
-    writer.WriteFast(a);
-    writer.WriteFast(b);
-    writer.WriteFast(c);
+  // UNROLL8
+    while (input + 3 < end) {
+    // We can write multiple codes for each flush.
+    
+    UNROLL8 for (int j = 0; j < 4; ++j) {
+      BitCode a = coding.codes[*input++];
+      writer.WriteFast(a);
+    }
     writer.Flush();
   }
   while (input < end) {
@@ -736,7 +721,7 @@ std::string CompressMulti(std::string_view raw) {
   int sym_count[256] = {};
   {
     int j[K] = {};
-    while (j[K - 1] < sizes[K - 1]) {
+    UNROLL8 while (j[K - 1] < sizes[K - 1]) {
       UNROLL8 for (int k = 0; k < K; ++k) {
         ++part_count[k][part_input[k][j[k]]];
         ++j[k];
@@ -763,9 +748,16 @@ std::string CompressMulti(std::string_view raw) {
     int pos = 0;
     for (int part = 0; part < K; ++part) {
       int64_t num_bits = 0;
-      for (int i = 0; i < sizes[part]; ++i) {
-        num_bits += coding.codes[uint8_t(raw[pos + i])].len;
+      for (int c = 0; c < 256; ++c) {
+        num_bits += part_count[part][c] * coding.codes[c].len;
       }
+#ifndef NDEBUG
+      int64_t num_bits_check = 0;
+      for (int i = 0; i < sizes[part]; ++i) {
+        num_bits_check += coding.codes[uint8_t(raw[pos + i])].len;
+      }
+      assert(num_bits == num_bits_check);
+#endif
       pos += sizes[part];
       end_offset[part] = (num_bits + 7) / 8 + kSlop;
     }
@@ -818,17 +810,17 @@ std::string CompressMulti(std::string_view raw) {
   }
 
 #if 1
-  while (part_input[K - 1] + 2 < part_end[K - 1]) {
-#pragma GCC unroll 8
-    for (int k = 0; k < K; ++k) {
-      // We can write three codes of up to 16 bits per each flush.
-      BitCode a = coding.codes[*part_input[k]++];
-      BitCode b = coding.codes[*part_input[k]++];
-      BitCode c = coding.codes[*part_input[k]++];
+  while (part_input[K - 1] + 3 < part_end[K - 1]) {
+    UNROLL8 for (int k = 0; k < K; ++k) {
       writer[k].Flush();
-      writer[k].WriteFast(a);
-      writer[k].WriteFast(b);
-      writer[k].WriteFast(c);
+    }
+    // We can write three codes of up to 14 bits per each flush.
+    static_assert(kMaxCodeLength <= 14);
+    UNROLL8 for (int j = 0; j < 4; ++j) {
+      UNROLL8 for (int k = 0; k < K; ++k) {
+        BitCode a = coding.codes[*part_input[k]++];
+        writer[k].WriteFast(a);
+      }
     }
   }
 #endif
@@ -988,6 +980,8 @@ bool VecEqual(__m512i a, __m512i b) {
 template <int K>
 std::string CompressMultiAvx512(std::string_view raw) {
   // Perform counting using AVX too.
+  abort();
+  return "";
 }
 
 template <int K, typename UsedDecoder>
