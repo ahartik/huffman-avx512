@@ -26,6 +26,10 @@ namespace {
 
 // Maximum code length we want to use.  Shorter max code lengths makes for
 // faster compression and decompression.
+//
+// Max code length 13 observes some cache misses with AVX-512 decompression,
+// reducing performance slightly and increasing variance. Lower max code length
+// is used to stay comparable to Huff0, which defaults to 11.
 const int kMaxCodeLength = 12;
 const uint32_t kMaxCodeMask = (1 << kMaxCodeLength) - 1;
 // Maximum code length that would be optimal in terms of compression.  We use
@@ -127,6 +131,7 @@ inline uint16_t ReverseBits16(uint16_t x) {
 }
 
 struct BitCode {
+  BitCode(uint16_t b=0, uint16_t l=0) : bits(b), len(l) {}
   uint16_t bits;
   // uint16_t mask;
   uint16_t len;
@@ -152,7 +157,6 @@ std::ostream& operator<<(std::ostream& out, const BitCode& code) {
 
 struct Node {
   int count = 0;
-
   int children[2] = {};
   uint8_t sym = 0;
   // Opposite order, since C++ heap is a max heap and we want
@@ -198,7 +202,7 @@ void ForallCodes(const uint8_t* len_count, const uint8_t* syms, int num_syms,
   int i = 0;
   for (int len = 0; (len <= kMaxCodeLength) && !aborted; ++len) {
     for (int j = 0; j < len_count[len]; ++j) {
-      if (!func(syms[i], BitCode{uint16_t(current_code), uint16_t(len)})) {
+      if (!func(syms[i], BitCode(current_code, len))) {
         aborted = true;
         break;
       }
@@ -215,7 +219,7 @@ void ForallCodes(const uint8_t* len_count, const uint8_t* syms, int num_syms,
 }
 
 struct CanonicalCoding {
-  BitCode codes[256] = {};
+  BitCode codes[256];
   uint8_t sorted_syms[256] = {};
   int num_syms = 0;
   uint8_t len_count[kMaxOptimalCodeLength + 1] = {};
@@ -257,7 +261,7 @@ void LimitCodeLengths(uint8_t* len_count) {
   }
 }
 
-CanonicalCoding MakeCanonicalCoding(int* sym_count) {
+CanonicalCoding MakeCanonicalCoding(const int* sym_count) {
   CanonicalCoding coding;
 
   std::vector<Node> heap;
@@ -299,6 +303,7 @@ CanonicalCoding MakeCanonicalCoding(int* sym_count) {
     heap.push_back(next);
     std::push_heap(heap.begin(), heap.end());
   }
+
   get_code_len(tree, &heap[0], 0, coding.len_count);
   // Build "canonical Huffman code".
 
@@ -353,8 +358,9 @@ class CodeWriter {
     memcpy(output_, &buf_, 8);
     output_ -= num_bytes;
     // Leftmost bits were consumed, remaining move to the very left.
-    buf_ <<= 8 * num_bytes;
-    buf_size_ -= 8 * num_bytes;
+    buf_ <<= (buf_size_ & (~7)); // Same as 8 * num_bytes;
+    // buf_size_ = 8 * num_bytes;
+    buf_size_ &= 7;
   }
 
   void WriteFast(BitCode code) {
@@ -622,7 +628,7 @@ std::string Compress(std::string_view raw) {
 
   // This pragma showed a 2% speedup once.
   // UNROLL8
-#pragma GCC unroll 4
+// #pragma GCC unroll 4
   while (input + 3 < end) {
     // We can write multiple codes for each flush.
 
@@ -732,7 +738,6 @@ std::string CompressMulti(std::string_view raw) {
       }
     }
   }
-  // CountSymbols(raw, sym_count);
   CanonicalCoding coding = MakeCanonicalCoding(sym_count);
 
   const int kSlop = 8;
@@ -770,18 +775,14 @@ std::string CompressMulti(std::string_view raw) {
     int count = coding.len_count[len];
     if (count != 0) {
       compressed.push_back(count);
-      // std::cout << len << " ";
     }
   }
-  // std::cout << "\n";
   compressed.append(reinterpret_cast<char*>(coding.sorted_syms),
                     coding.num_syms);
   for (int k = 0; k < K - 1; ++k) {
     write_u32(compressed, end_offset[k]);
   }
 
-  // std::cout << compressed.size() << " == " << header_size << "\n" <<
-  // std::flush;
   assert(compressed.size() == header_size);
   compressed.resize(compressed_size);
 
@@ -796,7 +797,6 @@ std::string CompressMulti(std::string_view raw) {
     writer[k].Init(part_output[k], part_output[k + 1]);
   }
 
-#if 1
   // It's slightly strange, but ordering these loops like this is faster.
   // Other way around gets better instruction parallelism, but also has more
   // instructions so ends up slower.
@@ -811,7 +811,6 @@ std::string CompressMulti(std::string_view raw) {
       }
     }
   }
-#endif
   // Write potential last symbols.
   for (int k = 0; k < K; ++k) {
     while (part_input[k] != part_end[k]) {
@@ -912,7 +911,6 @@ std::string DecompressMultiImpl(std::string_view compressed) {
               << "\n";
     }
   }
-
   return raw;
 }
 
@@ -1094,12 +1092,13 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
       bits[m] = _mm512_sllv_epi64(bits[m], bits_consumed_v[m]);
     }
     UNROLL8 for (int j = 0; j < 4; ++j) {
-      if (decoder.max_symbols_decoded() == 2) {
+      if constexpr (std::is_same_v<UsedDecoder, Decoder2x>) {
         // Table has 4 bytes for each entry. We read 64 bits for each entry
         // in order to keep the vectors 512 bits.
 
-        // This expression is merged into below.
-        // DEF_VECS(index, _mm512_srli_epi64(bits[m], 64 - kMaxCodeLength));
+        // Here the index is calculated as `bits >> (64 - kMaxCodeLength)`.
+        // Performing all of these gathers before doing any further processing
+        // is a significant optimization on Zen5.
         DEF_VECS(dsyms, _mm512_i64gather_epi64(
                             _mm512_srli_epi64(bits[m], 64 - kMaxCodeLength),
                             dtable_base, 4));
@@ -1127,7 +1126,6 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
           const vec8x64 sym_shift = _mm512_slli_epi64(write_len[m], 3);
           syms[m] = _mm512_or_epi64(syms[m],
                                     _mm512_sllv_epi64(these_syms, sym_shift));
-
           // Consume bits from input.
           const vec8x64 code_len =
               _mm512_and_epi64(dsyms[m], _mm512_set1_epi64(0xff));
@@ -1151,6 +1149,7 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
                                                write_len[m], num_decoded_syms);
         }
       } else {
+        static_assert(std::is_same_v<UsedDecoder, Decoder1x>);
         // Table has two bytes for each entry. We read 64 bits for each entry
         // due to two reasons:
         // 1. There is no instruction to "gather" only 2 bytes
@@ -1182,7 +1181,6 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
 
     FORM(m) {
       _mm512_mask_i64scatter_epi64(write_base, good[m], write_v[m], syms[m], 1);
-      // write_len[m] = _mm512_srli_epi64(write_len[m], 3);
       write_v[m] = _mm512_add_epi64(write_v[m], write_len[m]);
     }
   }
