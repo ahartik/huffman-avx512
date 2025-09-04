@@ -4,7 +4,6 @@
 #include <immintrin.h>
 #include <x86intrin.h>
 
-#include <ctype.h>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -31,7 +30,7 @@ namespace {
 // reducing performance slightly and increasing variance. Lower max code length
 // is used to stay comparable to Huff0, which defaults to 11.
 const int kMaxCodeLength = 12;
-const uint32_t kMaxCodeMask = (1 << kMaxCodeLength) - 1;
+// const uint32_t kMaxCodeMask = (1 << kMaxCodeLength) - 1;
 // Maximum code length that would be optimal in terms of compression.  We use
 // shorter codes with slightly worse compression to gain better performance.
 const int kMaxOptimalCodeLength = 32;
@@ -85,12 +84,30 @@ void CountSymbols(std::string_view text, int* sym_count) {
   }
 }
 
+// Returns the sizes of slices
+template <int K>
+std::array<size_t, K> SliceSizes(size_t len) {
+  std::array<size_t, K> sizes;
+  for (int i = 0; i < K; ++i) {
+    sizes[i] = len / K;
+  }
+  for (size_t i = 0; i < len % K; ++i) {
+    ++sizes[i];
+  }
+  return sizes;
+}
+
 }  // namespace internal
    //
 
 using namespace huffman::internal;
 
 namespace {
+
+using vec8x64 = __m512i;
+using vec64x8 = __m512i;
+using mask8 = __mmask8;
+using mask64 = __mmask64;
 
 int CountBits(uint64_t x) { return __builtin_popcountll(x); }
 
@@ -131,7 +148,7 @@ inline uint16_t ReverseBits16(uint16_t x) {
 }
 
 struct BitCode {
-  BitCode(uint16_t b=0, uint16_t l=0) : bits(b), len(l) {}
+  BitCode(uint16_t b = 0, uint16_t l = 0) : bits(b), len(l) {}
   uint16_t bits;
   // uint16_t mask;
   uint16_t len;
@@ -358,7 +375,7 @@ class CodeWriter {
     memcpy(output_, &buf_, 8);
     output_ -= num_bytes;
     // Leftmost bits were consumed, remaining move to the very left.
-    buf_ <<= (buf_size_ & (~7)); // Same as 8 * num_bytes;
+    buf_ <<= (buf_size_ & (~7));  // Same as 8 * num_bytes;
     // buf_size_ = 8 * num_bytes;
     buf_size_ &= 7;
   }
@@ -628,7 +645,7 @@ std::string Compress(std::string_view raw) {
 
   // This pragma showed a 2% speedup once.
   // UNROLL8
-// #pragma GCC unroll 4
+  // #pragma GCC unroll 4
   while (input + 3 < end) {
     // We can write multiple codes for each flush.
 
@@ -702,13 +719,7 @@ std::string Decompress(std::string_view compressed) {
 
 template <int K>
 std::string CompressMulti(std::string_view raw) {
-  int sizes[K] = {};
-  for (int i = 0; i < K; ++i) {
-    sizes[i] = raw.size() / K;
-  }
-  for (size_t i = 0; i < raw.size() % K; ++i) {
-    ++sizes[i];
-  }
+  const auto sizes = SliceSizes<K>(raw.size());
   // Start/end input pointers for each part.
   const uint8_t* part_input[K];
   part_input[0] = reinterpret_cast<const uint8_t*>(raw.data());
@@ -847,13 +858,7 @@ std::string DecompressMultiImpl(std::string_view compressed) {
   }
   end_offset[K - 1] = compressed.size();
 
-  int sizes[K] = {};
-  for (int i = 0; i < K; ++i) {
-    sizes[i] = raw_size / K;
-  }
-  for (size_t i = 0; i < raw_size % K; ++i) {
-    ++sizes[i];
-  }
+  const auto sizes = SliceSizes<K>(raw_size);
   for (size_t i = 0; i < K; ++i) {
     DLOG(1) << std::format("sizes[{}] = {}\n", i, sizes[i]);
   }
@@ -965,9 +970,238 @@ bool VecEqual(__m512i a, __m512i b) {
 
 template <int K>
 std::string CompressMultiAvx512(std::string_view raw) {
-  // Perform counting using AVX too.
-  abort();
-  return "";
+  // This restriction could be lifted by using masks.
+  static_assert(K % 8 == 0);
+
+  const auto sizes = SliceSizes<K>(raw.size());
+  uint64_t read_index[K];
+  read_index[0] = 0;
+  for (int k = 1; k < K; ++k) {
+    read_index[k] = read_index[k - 1] + sizes[k - 1];
+  }
+  uint64_t read_end[K];
+  for (int k = 0; k < K; ++k) {
+    read_end[k] = read_index[k] + sizes[k];
+  }
+  // Count symbols in each component.
+  // (I think this performs "value-initialization" on std::array elements,
+  // which means the counts are set to zero.)
+  std::vector<std::array<int, 256>> part_count(K);
+  assert(part_count[0][7] == 0);
+  int sym_count[256] = {};
+  {
+    for (int k = 0; k < K; ++k) {
+      CountSymbols(raw.substr(read_index[k], sizes[k]),
+                   part_count[k].data());
+    }
+    for (int k = 0; k < K; ++k) {
+      for (int i = 0; i < 256; ++i) {
+        sym_count[i] += part_count[k][i];
+      }
+    }
+  }
+  CanonicalCoding coding = MakeCanonicalCoding(sym_count);
+
+  const int kSlop = 8;
+  // Compute starting positions for each part in the output.
+  uint64_t write_end[K] = {};
+  {
+    int pos = 0;
+    for (int part = 0; part < K; ++part) {
+      int64_t num_bits = 0;
+      for (int c = 0; c < 256; ++c) {
+        num_bits += part_count[part][c] * coding.codes[c].len;
+      }
+      pos += sizes[part];
+      write_end[part] = (num_bits + 7) / 8 + kSlop;
+    }
+  }
+  for (int i = 1; i < K; ++i) {
+    write_end[i] += write_end[i - 1];
+  }
+  DLOG(1) << "End offsets: ";
+  for (int i = 0; i < K; ++i) {
+    DLOG(1) << write_end[i] << " ";
+  }
+  DLOG(1) << "\n";
+
+  // TODO: Use varints
+  const size_t header_size =
+      4 + 4 + CountBits(coding.len_mask) + coding.num_syms + (K - 1) * (4);
+  const size_t compressed_size = header_size + write_end[K - 1];
+  std::string compressed;
+  compressed.reserve(compressed_size);
+  write_u32(compressed, raw.size());
+  write_u32(compressed, coding.len_mask);
+  for (int len = 0; len < 32; ++len) {
+    int count = coding.len_count[len];
+    if (count != 0) {
+      compressed.push_back(count);
+    }
+  }
+  compressed.append(reinterpret_cast<char*>(coding.sorted_syms),
+                    coding.num_syms);
+  for (int k = 0; k < K - 1; ++k) {
+    write_u32(compressed, write_end[k]);
+  }
+
+  assert(compressed.size() == header_size);
+  compressed.resize(compressed_size);
+  const void* const read_base = raw.data();
+  char* const write_base = compressed.data() + header_size;
+  uint64_t write_index[K];
+  for (int k = 0; k < K; ++k) {
+    write_index[k] = write_end[k] - 8;
+  }
+
+  // Instead of using look up tables, AVX-512 registers and shuffles are used.
+  vec64x8 hi_v[4];
+  vec64x8 lo_v[4];
+  vec64x8 len_v[4];
+  {
+    uint8_t hi_arr[256];
+    uint8_t lo_arr[256];
+    uint8_t len_arr[256];
+    for (int c = 0; c < 256; ++c) {
+      uint16_t code16 = coding.codes[c].bits << (16 - kMaxCodeLength);
+      hi_arr[c] = code16 >> 8;
+      lo_arr[c] = code16 & 0xff;
+      len_arr[c] = coding.codes[c].len;
+    }
+    for (int i = 0; i < 4; ++i) {
+      hi_v[i] = _mm512_loadu_epi8(hi_arr + 64 * i);
+      lo_v[i] = _mm512_loadu_epi8(lo_arr + 64 * i);
+      len_v[i] = _mm512_loadu_epi8(len_arr + 64 * i);
+    }
+  }
+
+  // These variables are for storing the leftover state.
+  uint64_t buf_arr[K];
+  uint64_t buf_len_arr[K];
+  const int M = K / 8;
+  for (int m = 0; m < M; ++m) {
+    vec8x64 buf_v = _mm512_setzero_si512();
+    vec8x64 buf_len_v = _mm512_setzero_si512();
+    vec8x64 read_v = _mm512_loadu_epi64(read_index + 8 * m);
+    vec8x64 write_v = _mm512_loadu_epi64(write_index + 8 * m);
+
+    // Last stripe is always one of the smallest, so we can just base our loop
+    // condition on that.
+    for (size_t read_i = 0; read_i + 7 < sizes[K - 1]; read_i += 8) {
+      // Read bytes
+      vec8x64 bytes = _mm512_i64gather_epi64(read_v, read_base, 1);
+      read_v = _mm512_add_epi64(read_v, _mm512_set1_epi64(8));
+      // Decode all 64 bytes simultaneously.
+      vec64x8 code_hi = _mm512_permutexvar_epi8(bytes, hi_v[0]);
+      vec64x8 code_lo = _mm512_permutexvar_epi8(bytes, lo_v[0]);
+      vec64x8 code_len = _mm512_permutexvar_epi8(bytes, len_v[0]);
+      UNROLL8 for (int k = 1; k < 4; ++k) {
+        mask64 cmp =
+            _mm512_cmpge_epu8_mask(bytes, _mm512_set1_epi8(char(k * 64)));
+        code_hi = _mm512_mask_permutexvar_epi8(code_hi, cmp, bytes, hi_v[k]);
+        code_lo = _mm512_mask_permutexvar_epi8(code_lo, cmp, bytes, lo_v[k]);
+        code_len = _mm512_mask_permutexvar_epi8(code_len, cmp, bytes, len_v[k]);
+      }
+      // Now, we must rearrange and pack these codes. We'll do this by
+      // processing 4 symbols for each stream at a time.
+      UNROLL8 for (int j = 0; j < 2; ++j) {
+        const vec64x8 hi_ctrl =
+            _mm512_set4_epi64(0x08ff09ff0aff0bff + j * 0x0400040004000400,
+                              0x00ff01ff02ff03ff + j * 0x0400040004000400,
+                              0x08ff09ff0aff0bff + j * 0x0400040004000400,
+                              0x00ff01ff02ff03ff + j * 0x0400040004000400);
+        const vec64x8 lo_ctrl =
+            _mm512_set4_epi64(0xff08ff09ff0aff0b + j * 0x0004000400040004,
+                              0xff00ff01ff02ff03 + j * 0x0004000400040004,
+                              0xff08ff09ff0aff0b + j * 0x0004000400040004,
+                              0xff00ff01ff02ff03 + j * 0x0004000400040004);
+        vec64x8 pack16 = _mm512_or_epi64(_mm512_shuffle_epi8(code_hi, hi_ctrl),
+                                         _mm512_shuffle_epi8(code_lo, lo_ctrl));
+        vec64x8 len16 = _mm512_shuffle_epi8(code_len, lo_ctrl);
+        // Now four codes are stored in the 16-bit words of each 64-bit integer
+        // in `pack16`, with one 64-bit integer for each stream. `len16` stores
+        // the length of each code in a 16-bit word at the same position.  Next
+        // we must pack the codes by shifting.
+
+        // For each 64-bit word:
+        // 1. Bits 48:63 are not shifted.
+        // 2. Bits 32:47 are shifted left by (16 - len16[48:63])
+        // 3. Bits 16:31 are shifted left by (32 - len16[48:63] - len16[32:47])
+        // 4. Bits  0:15 are shifted left by (48 - len16[48:64] - len16[32:47] -
+        //    len16[16:31]).
+        // TODO: Optimize using _mm512_shuffle_epi8
+        const vec8x64 len1 = _mm512_srli_epi64(len16, 48);
+        const vec8x64 len2 = _mm512_and_epi64(_mm512_srli_epi64(len16, 32),
+                                              _mm512_set1_epi64(0xff));
+        const vec8x64 len3 = _mm512_and_epi64(_mm512_srli_epi64(len16, 16),
+                                              _mm512_set1_epi64(0xff));
+        const vec8x64 len4 = _mm512_and_epi64(len16, _mm512_set1_epi64(0xff));
+        vec8x64 shift2 = _mm512_sub_epi64(_mm512_set1_epi64(16), len1);
+        vec8x64 shift3 = _mm512_sub_epi64(_mm512_set1_epi64(32),
+                                          _mm512_add_epi64(len1, len2));
+        vec8x64 shift4 = _mm512_sub_epi64(
+            _mm512_set1_epi64(48),
+            _mm512_add_epi64(len1, _mm512_add_epi64(len2, len3)));
+
+        vec8x64 packed =
+            _mm512_and_epi64(pack16, _mm512_set1_epi64(0xffffULL << 48));
+        packed = _mm512_or_epi64(
+            packed,
+            _mm512_sllv_epi64(
+                _mm512_and_epi64(pack16, _mm512_set1_epi64(0xffffULL << 32)),
+                shift2));
+        packed = _mm512_or_epi64(
+            packed,
+            _mm512_sllv_epi64(
+                _mm512_and_epi64(pack16, _mm512_set1_epi64(0xffffULL << 16)),
+                shift3));
+        packed = _mm512_or_epi64(
+            packed,
+            _mm512_sllv_epi64(
+                _mm512_and_epi64(pack16, _mm512_set1_epi64(0xffffULL)),
+                shift4));
+
+        vec8x64 len_tot = _mm512_add_epi64(
+            len1, _mm512_add_epi64(len2, _mm512_add_epi64(len3, len4)));
+        // Add `packed` to `buf_v`
+        buf_v = _mm512_or_epi64(buf_v, _mm512_srlv_epi64(packed, buf_len_v));
+        buf_len_v = _mm512_add_epi64(buf_len_v, len_tot);
+        // Flush buffer
+        vec8x64 num_bytes = _mm512_srli_epi64(buf_len_v, 3);
+        _mm512_i64scatter_epi64(write_base, write_v, buf_v, 1);
+        write_v = _mm512_sub_epi64(write_v, num_bytes);
+        // Shift these bytes out to the left from `buf_v`.
+        vec8x64 written_bits = _mm512_and_epi64(buf_len_v, _mm512_set1_epi64(~7));
+        buf_v = _mm512_sllv_epi64(buf_v, written_bits);
+        buf_len_v = _mm512_and_epi64(buf_len_v, _mm512_set1_epi64(7));
+      }
+    }
+    // Store vector registers back to C arrays.
+    _mm512_storeu_epi64(buf_arr + 8 * m, buf_v);
+    _mm512_storeu_epi64(buf_len_arr + 8 * m, buf_len_v);
+    _mm512_storeu_epi64(read_index + 8 * m, read_v);
+    _mm512_storeu_epi64(write_index + 8 * m, write_v);
+  }
+  // Write remaining bytes one stream at a time.
+  for (int k = 0; k < K; ++k) {
+    uint64_t buf = buf_arr[k];
+    uint64_t buf_len = buf_len_arr[k];
+    char* write_ptr = write_base + write_index[k];
+    for (uint64_t i = read_index[k]; i < read_end[k]; ++i) {
+      const uint8_t s = raw[i];
+      auto code = coding.codes[s];
+      buf |= uint64_t(code.bits) << (64 - buf_len - kMaxCodeLength);
+      buf_len += code.len;
+      // Flush:
+      memcpy(write_ptr, &buf, 8);
+      uint32_t num_bytes = buf_len >> 3;
+      write_ptr -= num_bytes;
+      buf <<= 8 * num_bytes;
+      buf_len &= 7;
+    }
+  }
+
+  return compressed;
 }
 
 template <int K, typename UsedDecoder>
@@ -1028,8 +1262,6 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
     write_end[k] = write_offset[k] + sizes[k];
   }
 
-  using vec8x64 = __m512i;
-
 #define DEF_ARR(type, name, val)                             \
   type name[M];                                              \
   do {                                                       \
@@ -1050,8 +1282,6 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
                             _mm512_set1_epi64(7)));
 
   DEF_ARR(vec8x64, bits_consumed_v, zero_v);
-
-  using mask8 = __mmask8;
 
   DEF_ARR(mask8, good, _mm512_cmplt_epi64_mask(write_v[m], write_limit_v[m]));
 
@@ -1226,4 +1456,7 @@ template std::string DecompressMulti<16>(std::string_view compressed);
 template std::string DecompressMultiAvx512<8>(std::string_view compressed);
 template std::string DecompressMultiAvx512<16>(std::string_view compressed);
 template std::string DecompressMultiAvx512<32>(std::string_view compressed);
+template std::string CompressMultiAvx512<8>(std::string_view compressed);
+template std::string CompressMultiAvx512<16>(std::string_view compressed);
+template std::string CompressMultiAvx512<32>(std::string_view compressed);
 }  // namespace huffman

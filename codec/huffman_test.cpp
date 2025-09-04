@@ -1,9 +1,10 @@
-#include "codec/huffman.h"
 #include "codec/huff0.h"
+#include "codec/huffman.h"
 
-#include <random>
-#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
+#include <format>
+#include <random>
 
 #include <format>
 #include <string>
@@ -11,10 +12,28 @@
 
 using std::string;
 
+template <int K>
+class AvxCheckCompressor {
+ public:
+  static std::string Compress(std::string_view raw) {
+    std::string avx = huffman::CompressMultiAvx512<K>(raw);
+    std::string regular = huffman::CompressMulti<K>(raw);
+    EXPECT_EQ(avx, regular);
+    return avx;
+  }
+  static std::string Decompress(std::string_view compressed) {
+    std::string avx = huffman::DecompressMultiAvx512<K>(compressed);
+    std::string regular = huffman::DecompressMulti<K>(compressed);
+    EXPECT_EQ(avx, regular);
+    return avx;
+  }
 
-template<typename T>
+  static std::string name() { return std::format("AvxCheckCompressor<{}>", K); }
+};
+
+template <typename T>
 class CompressorTest : public ::testing::Test {
-  public:
+ public:
 };
 
 class NameGenerator {
@@ -25,15 +44,12 @@ class NameGenerator {
   }
 };
 
-using Compressors = ::testing::Types<huffman::HuffmanCompressor,
-      huffman::HuffmanCompressorMulti<4>,
-      huffman::HuffmanCompressorMulti<8>,
-      huffman::HuffmanCompressorMulti<32>,
-      // XXX: Fix the decompressor
-      huffman::HuffmanCompressorAvx<8>,
-      huffman::HuffmanCompressorAvx<32>,
-      huffman::Huff0Compressor
-      >;
+using Compressors = ::testing::Types<
+    huffman::HuffmanCompressor, huffman::HuffmanCompressorMulti<4>,
+    huffman::HuffmanCompressorMulti<8>, huffman::HuffmanCompressorMulti<32>,
+    // XXX: Fix the decompressor
+    huffman::HuffmanCompressorAvx<8>, huffman::HuffmanCompressorAvx<32>,
+    AvxCheckCompressor<8>, huffman::Huff0Compressor>;
 TYPED_TEST_SUITE(CompressorTest, Compressors, NameGenerator);
 
 TYPED_TEST(CompressorTest, Hello) {
@@ -86,7 +102,7 @@ TYPED_TEST(CompressorTest, LongRandom) {
     do {
       // Make a biased distribution
       ch = (rand() & rand() & rand()) & 0xff;
-    } while(!std::isprint(ch));
+    } while (!std::isprint(ch));
     raw.push_back(ch);
   }
   string compressed = TypeParam::Compress(raw);
@@ -109,7 +125,7 @@ TYPED_TEST(CompressorTest, LongCodes) {
   const int kLogSize = 16;
   string text;
   for (int i = 0; i < kLogSize; ++i) {
-    for (int j = 0; j < (1<<i); ++j) {
+    for (int j = 0; j < (1 << i); ++j) {
       text.push_back('A' + i);
     }
   }
@@ -147,7 +163,6 @@ TYPED_TEST(CompressorTest, ManyRandom) {
     ASSERT_EQ(raw, decompressed) << "k = " << k;
   }
 }
-
 
 TEST(MultiTest, Compress2) {
   string raw = "Hello World";

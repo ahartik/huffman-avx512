@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <string>
 #include <format>
 #include <string_view>
@@ -14,6 +13,9 @@ template <int K>
 std::string CompressMulti(std::string_view raw);
 template <int K>
 std::string DecompressMulti(std::string_view compressed);
+
+template <int K>
+std::string CompressMultiAvx512(std::string_view raw);
 template <int K>
 std::string DecompressMultiAvx512(std::string_view compressed);
 
@@ -50,15 +52,12 @@ class HuffmanCompressorAvx {
   static_assert(K % 8 == 0,
                 "K must be a multiple of 8 in HuffmanCompressorAvx<K>");
   static std::string Compress(std::string_view raw) {
-    return CompressMulti<K>(raw);
+    return CompressMultiAvx512<K>(raw);
   }
   static std::string Decompress(std::string_view compressed) {
     return DecompressMultiAvx512<K>(compressed);
   }
 
-  static std::string DecompressInto(std::string_view compressed) {
-    return DecompressMultiAvx512<K>(compressed);
-  }
   static std::string name() {
     return std::format("HuffmanAvx<{}>", K);
   }
