@@ -180,6 +180,25 @@ TEST(MultiTest, Compress2) {
 
 TEST(InternalsTest, CountSymbols) {
   std::string text = "foofoobarbar";
-  int sym_count[256];
+  int sym_count[256] = {};
   ::huffman::internal::CountSymbols(text, sym_count);
+  EXPECT_EQ(sym_count['f'], 2);
+}
+
+TEST(InternalsTest, CountSymbolsLong) {
+  string raw;
+  int len = 2007;
+  for (int i = 0; i < len; ++i) {
+    uint8_t ch = (rand() & rand() & rand()) & 0xff;
+    raw.push_back(ch);
+  }
+  int sym_count[256] = {};
+  ::huffman::internal::CountSymbols(raw, sym_count);
+
+  // Perform simplest possible counting
+  int simple_count[256] = {};
+  for (uint8_t c : raw) ++simple_count[c];
+  for (int i = 0; i < 256; ++i) {
+    EXPECT_EQ(sym_count[i], simple_count[i]) << "i = " << i;
+  }
 }

@@ -150,6 +150,23 @@ void BM_DecompressLong(benchmark::State& state) {
   state.counters["ratio"] = ratio;
 }
 
+void BM_CountSymbols(benchmark::State& state) {
+  const int kLogSize = 16;
+  std::string text;
+  for (int i = 0; i < kLogSize; ++i) {
+    for (int j = 0; j < (1 << i); ++j) {
+      text.push_back('A' + i);
+    }
+  }
+  std::shuffle(text.begin(), text.end(), std::mt19937());
+  text = text.substr(0, 100000 / 32);
+  for (auto _ : state) {
+    int sym_count[256] = {};
+    huffman::internal::CountSymbols(text, sym_count);
+  }
+  state.SetBytesProcessed(state.iterations() * text.size());
+}
+
 }  // namespace
 
 #define DEFINE_BENCHMARKS(TYPE)          \
@@ -170,3 +187,6 @@ DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvx<16>)
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvx<32>)
 
 DEFINE_BENCHMARKS(::huffman::Huff0Compressor)
+
+
+BENCHMARK(BM_CountSymbols);

@@ -84,12 +84,123 @@ std::string Int64VecToString(__m512i vec) {
     }                                                                   \
   } while (0)
 
-// Vector helpers:
-//
-
 }  // namespace
 
 namespace internal {
+
+void CountSymbolsVectorized(std::string_view text, int* sym_count) {
+  // I think the () at the end of the new-expression guarantees that the array
+  // gets zeroed.
+  const std::unique_ptr<std::array<uint32_t, 256>[]> tmp_count(
+      new std::array<uint32_t, 256>[16]());
+  assert(tmp_count[2][7] == 0);
+  const size_t text_size = text.size();
+  const uint8_t* ptr = reinterpret_cast<const uint8_t*>(text.data());
+  const uint8_t* end = ptr + text_size;
+  if (ptr + 16 < end) {
+    __m128i nextVec = _mm_loadu_si128((const __m128i*)ptr);
+    ptr += 16;
+    while (ptr + 16 < end) {
+      __m128i vec = nextVec;
+      nextVec = _mm_loadu_si128((const __m128i*)ptr);
+      ptr += 16;
+
+      // TODO: This can also be achieved using C++ templates.
+#if 1
+#define ADD_ONE(j)                         \
+  do {                                     \
+    uint64_t b = _mm_extract_epi8(vec, j); \
+    ++tmp_count[j][b];                     \
+  } while (0)
+
+      // clang-format off
+      ADD_ONE(0); ADD_ONE(1); ADD_ONE(2); ADD_ONE(3);
+      ADD_ONE(4); ADD_ONE(5); ADD_ONE(6); ADD_ONE(7);
+      ADD_ONE(8); ADD_ONE(9); ADD_ONE(10); ADD_ONE(11);
+      ADD_ONE(12); ADD_ONE(13); ADD_ONE(14); ADD_ONE(15);
+      // clang-format on
+#undef ADD_ONE
+#elif 0
+
+#define ADD_TWO(j)                        \
+  do {                                     \
+    uint16_t b = _mm_extract_epi16(vec, j);\
+    ++tmp_count[j*2][b & 0xff];            \
+    ++tmp_count[j*2+1][(b>>8) & 0xff];     \
+  } while (0)
+
+      // clang-format off
+      ADD_TWO(0); ADD_TWO(1); ADD_TWO(2); ADD_TWO(3);
+      ADD_TWO(4); ADD_TWO(5); ADD_TWO(6); ADD_TWO(7);
+      // clang-format on
+#undef ADD_TWO
+
+#else
+
+#define ADD_FOUR(j)                        \
+  do {                                     \
+    uint32_t b = _mm_extract_epi32(vec, j);\
+    ++tmp_count[j*4][b & 0xff];            \
+    ++tmp_count[j*4+1][(b>>8) & 0xff];     \
+    ++tmp_count[j*4+2][(b>>16) & 0xff];     \
+    ++tmp_count[j*4+3][(b>>24) & 0xff];     \
+  } while (0)
+      // clang-format off
+      ADD_FOUR(0); ADD_FOUR(1); ADD_FOUR(2); ADD_FOUR(3);
+      // clang-format on
+#undef ADD_FOUR
+#endif
+    }
+    ptr -= 16;
+  }
+
+  while (ptr < end) {
+    ++tmp_count[0][*ptr++];
+  }
+  // TODO: Vectorize this
+  for (int c = 0; c < 256; ++c) {
+    sym_count[c] = 0;
+    UNROLL8 for (int j = 0; j < 16; ++j) { sym_count[c] += tmp_count[j][c]; }
+  }
+}
+
+// This is not very fast :(
+void CountSymbolsGatherScatter(std::string_view text, int* sym_count) {
+  // I think the () at the end of the new-expression guarantees that the array
+  // gets zeroed.
+  const std::unique_ptr<uint32_t[]> tmp_count(new uint32_t[16 * 256]());
+  assert(tmp_count[27] == 0);
+  const size_t text_size = text.size();
+  const uint8_t* ptr = reinterpret_cast<const uint8_t*>(text.data());
+  const uint8_t* end = ptr + text_size;
+
+  uint32_t index_offset[16];
+  for (int i = 0; i < 16; ++i) {
+    index_offset[i] = 256 * i;
+  }
+  const __m512i offset_v = _mm512_loadu_epi16(index_offset);
+  const __m512i one32 = _mm512_set1_epi32(1);
+  while (ptr + 16 < end) {
+    __m128i bytes = _mm_loadu_si128((const __m128i*)ptr);
+    ptr += 16;
+    __m512i index = _mm512_cvtepu8_epi32(bytes);
+    index = _mm512_add_epi32(index, offset_v);
+
+    __m512i cnt = _mm512_i32gather_epi32(index, tmp_count.get(), 4);
+    cnt = _mm512_add_epi32(cnt, one32);
+
+    _mm512_i32scatter_epi32(tmp_count.get(), index, cnt, 4);
+  }
+
+  while (ptr < end) {
+    ++tmp_count[*ptr++];
+  }
+  // TODO: Vectorize this
+  for (int c = 0; c < 256; ++c) {
+    sym_count[c] = 0;
+    UNROLL8 for (int j = 0; j < 16; ++j) { sym_count[c] += tmp_count[j * 256 + c]; }
+  }
+}
 
 void CountSymbols(std::string_view text, int* sym_count) {
   // Idea copied from Huff0: count in four stripes to maximize superscalar
@@ -99,30 +210,35 @@ void CountSymbols(std::string_view text, int* sym_count) {
       ++sym_count[uint8_t(text[i])];
     }
   } else {
+    // CountSymbolsVectorized(text, sym_count);
+    // CountSymbolsGatherScatter(text, sym_count);
+#if 1
     // 4K, hopefully still fits on the stack.
-    int tmp_count[4][256] = {};
+    
+    int tmp_count[8][256] = {};
     const size_t text_size = text.size();
     const uint8_t* ptr = reinterpret_cast<const uint8_t*>(text.data());
     const uint8_t* end = ptr + text_size;
     // Unrolling here is a very very small improvement
 #pragma GCC unroll 4
-    while (ptr + 3 < end) {
+    while (ptr + 7 < end) {
       // Four bytes at a time is slightly faster than 8.
-      uint32_t data;
-      memcpy(&data, ptr, 4);
-      ptr += 4;
-      ++tmp_count[0][data & 0xff];
-      ++tmp_count[1][(data >> 8) & 0xff];
-      ++tmp_count[2][(data >> 16) & 0xff];
-      ++tmp_count[3][(data >> 24) & 0xff];
+      uint64_t data;
+      memcpy(&data, ptr, 8);
+      ptr += 8;
+      UNROLL8 for (int j = 0; j < 8; ++j) {
+        ++tmp_count[j][(data >> (j * 8)) & 0xff];
+      }
     }
     while (ptr < end) {
       ++tmp_count[0][*ptr++];
     }
     for (int c = 0; c < 256; ++c) {
-      sym_count[c] =
-          tmp_count[0][c] + tmp_count[1][c] + tmp_count[2][c] + tmp_count[3][c];
+      for (int j = 0; j < 8; ++j) {
+        sym_count[c] += tmp_count[j][c];
+      }
     }
+#endif
   }
 }
 
@@ -1201,11 +1317,9 @@ std::string CompressMultiAvx512(std::string_view raw) {
     }
 
     // Decode all 64 bytes simultaneously.
-    vec64x8 code_hi[M];
-    vec64x8 code_lo[M];
+    DEF_VECS(code_hi, _mm512_permutexvar_epi8(bytes[m], hi_v[0]));
+    DEF_VECS(code_lo, _mm512_permutexvar_epi8(bytes[m], lo_v[0]));
     FORM(m) {
-      code_hi[m] = _mm512_permutexvar_epi8(bytes[m], hi_v[0]);
-      code_lo[m] = _mm512_permutexvar_epi8(bytes[m], lo_v[0]);
       UNROLL8 for (int k = 1; k < 4; ++k) {
         mask64 cmp =
             _mm512_cmpge_epu8_mask(bytes[m], _mm512_set1_epi8(char(k * 64)));
