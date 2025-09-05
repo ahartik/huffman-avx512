@@ -189,10 +189,7 @@ inline uint16_t ReverseBits16(uint16_t x) {
   return (x >> 8) | (x << 8);
 }
 
-template <int W>
-vec8x64 GetWord16(vec8x64 vec) {
-  static_assert(W >= 0);
-  static_assert(W < 4);
+vec8x64 GetWord16(vec8x64 vec, int W) {
   switch (W) {
     case 0:
       return _mm512_and_epi64(vec, _mm512_set1_epi64(0xffffULL));
@@ -208,6 +205,32 @@ vec8x64 GetWord16(vec8x64 vec) {
     }
     case 3: {
       return _mm512_srli_epi64(vec, 48);
+    }
+    default:
+      // This should not be reached.
+      assert(false);
+      return vec;
+  }
+}
+
+vec8x64 GetWord16ToTopBits(vec8x64 vec, int W) {
+  switch (W) {
+    case 0:
+      return _mm512_slli_epi64(vec, 48);
+    case 1: {
+      vec64x8 ctrl =
+          _mm512_set4_epi64(0x0b0a'FFFF'FFFF'FFFF, 0x0302'ffff'fffF'ffff,
+                            0x0b0a'FFFF'FFFF'FFFF, 0x0302'ffff'fffF'ffff);
+      return _mm512_shuffle_epi8(vec, ctrl);
+    }
+    case 2: {
+      vec64x8 ctrl =
+          _mm512_set4_epi64(0x0d0c'ffff'fffF'ffff, 0x0504'ffff'fffF'ffff,
+                            0x0d0c'ffff'fffF'ffff, 0x0504'ffff'fffF'ffff);
+      return _mm512_shuffle_epi8(vec, ctrl);
+    }
+    case 3: {
+      return _mm512_and_epi64(vec, _mm512_set1_epi64(0xffffULL << 48));
     }
     default:
       // This should not be reached.
@@ -1100,26 +1123,25 @@ std::string CompressMultiAvx512(std::string_view raw) {
     write_index[k] = write_end[k] - 8;
   }
 
-  // Instead of using look up tables, AVX-512 registers and shuffles are used.
+  // Instead of using look up tables, AVX-512 registers and cross-lane shuffles
+  // (vpermb) are used.
   vec64x8 hi_v[4];
   vec64x8 lo_v[4];
-  // vec64x8 len_v[4];
   {
     uint8_t hi_arr[256];
     uint8_t lo_arr[256];
-    // uint8_t len_arr[256];
     for (int c = 0; c < 256; ++c) {
       uint16_t code16 = coding.codes[c].bits << (16 - kMaxCodeLength);
       hi_arr[c] = code16 >> 8;
+      // Pack length into the low byte instead of using separate arrays and
+      // registers.
       lo_arr[c] = (code16 & 0xff) + coding.codes[c].len;
       assert((code16 & 15) == 0);
       assert(coding.codes[c].len <= 12);
-      // len_arr[c] = coding.codes[c].len;
     }
     for (int i = 0; i < 4; ++i) {
       hi_v[i] = _mm512_loadu_epi8(hi_arr + 64 * i);
       lo_v[i] = _mm512_loadu_epi8(lo_arr + 64 * i);
-      // len_v[i] = _mm512_loadu_epi8(len_arr + 64 * i);
     }
   }
 
@@ -1136,9 +1158,21 @@ std::string CompressMultiAvx512(std::string_view raw) {
     // Last stripe is always one of the smallest, so we can just base our loop
     // condition on that.
     for (size_t read_i = 0; read_i + 7 < sizes[m * 8 + 7]; read_i += 8) {
-      // Read bytes
+      const vec64x8 lohi_ctrl =
+          _mm512_set4_epi64(0x0f0e'0d0c'0706'0504, 0x0b0a'0908'0302'0100,
+                            0x0f0e'0d0c'0706'0504, 0x0b0a'0908'0302'0100);
       vec8x64 bytes = _mm512_i64gather_epi64(read_v, read_base, 1);
       read_v = _mm512_add_epi64(read_v, _mm512_set1_epi64(8));
+
+      // Low and high bytes of the codes are combined using
+      // _mm512_unpacklo_epi8 and _mm512_unpackhi_epi8 below. For these
+      // instructions to work we must move the bytes corresponding to first and
+      // second 4 symbols to lower and upper words of each 128-bit lane.
+      //
+      // By shuffling the input bytes we don't need to perform multiple
+      // shuffles later.
+      bytes = _mm512_shuffle_epi8(bytes, lohi_ctrl);
+
       // Decode all 64 bytes simultaneously.
       vec64x8 code_hi = _mm512_permutexvar_epi8(bytes, hi_v[0]);
       vec64x8 code_lo = _mm512_permutexvar_epi8(bytes, lo_v[0]);
@@ -1148,107 +1182,36 @@ std::string CompressMultiAvx512(std::string_view raw) {
         code_hi = _mm512_mask_permutexvar_epi8(code_hi, cmp, bytes, hi_v[k]);
         code_lo = _mm512_mask_permutexvar_epi8(code_lo, cmp, bytes, lo_v[k]);
       }
-      // Length was stored in low bits of `code_lo`
-      vec64x8 code_len = _mm512_and_si512(code_lo, _mm512_set1_epi8(0xf));
-      code_lo = _mm512_and_si512(code_lo, _mm512_set1_epi8(0xf0));
+
       // Now, we must rearrange and pack these codes. We'll do this by
       // processing 4 symbols for each stream at a time.
       UNROLL8 for (int j = 0; j < 2; ++j) {
-        const vec64x8 hi_ctrl =
-            _mm512_set4_epi64(0x08ff09ff0aff0bff + j * 0x0400040004000400,
-                              0x00ff01ff02ff03ff + j * 0x0400040004000400,
-                              0x08ff09ff0aff0bff + j * 0x0400040004000400,
-                              0x00ff01ff02ff03ff + j * 0x0400040004000400);
-        const vec64x8 lo_ctrl =
-            _mm512_set4_epi64(0xff08ff09ff0aff0b + j * 0x0004000400040004,
-                              0xff00ff01ff02ff03 + j * 0x0004000400040004,
-                              0xff08ff09ff0aff0b + j * 0x0004000400040004,
-                              0xff00ff01ff02ff03 + j * 0x0004000400040004);
-        vec64x8 pack16 = _mm512_or_epi64(_mm512_shuffle_epi8(code_hi, hi_ctrl),
-                                         _mm512_shuffle_epi8(code_lo, lo_ctrl));
-        vec64x8 len16 = _mm512_shuffle_epi8(code_len, lo_ctrl);
+        vec64x8 pack16 = j == 0 ? _mm512_unpacklo_epi8(code_lo, code_hi)
+                                : _mm512_unpackhi_epi8(code_lo, code_hi);
+        // Length was stored in low bits of `code_lo`
+        vec64x8 len16 = _mm512_and_si512(pack16, _mm512_set1_epi16(0xf));
+        // (Using "andnot" instead of "and" saves one register.)
+        pack16 = _mm512_andnot_si512(_mm512_set1_epi16(0xf), pack16);
         // Now four codes are stored in the 16-bit words of each 64-bit integer
         // in `pack16`, with one 64-bit integer for each stream. `len16` stores
         // the length of each code in a 16-bit word at the same position.  Next
         // we must pack the codes by shifting.
 
-        // For each 64-bit word:
-        // 1. Bits 48:63 are not shifted.
-        // 2. Bits 32:47 are shifted left by (16 - len16[48:63])
-        // 3. Bits 16:31 are shifted left by (32 - len16[48:63] - len16[32:47])
-        // 4. Bits  0:15 are shifted left by (48 - len16[48:64] - len16[32:47] -
-        //    len16[16:31]).
-        // TODO: Optimize using _mm512_shuffle_epi8
-        const vec8x64 shift_a = _mm512_sub_epi64(_mm512_set1_epi16(16), len16);
-        const vec8x64 shift2 =  GetWord16<3>(shift_a);
-        const vec8x64 shift_sum2 =
-            _mm512_add_epi64(shift_a, _mm512_srli_epi64(shift_a, 16));
-        const vec8x64 shift3 = GetWord16<2>(shift_sum2);
-        const vec8x64 shift_sum3 =
-            _mm512_add_epi64(shift_a, _mm512_srli_epi64(shift_sum2, 16));
-        vec8x64 shift4 = GetWord16<1>(shift_sum3);
+        UNROLL8 for (int z = 0; z < 4; ++z) {
+          const vec64x8 len = GetWord16(len16, z);
+          const vec64x8 code_left = GetWord16ToTopBits(pack16, z);
+          buf_v =
+              _mm512_or_epi64(buf_v, _mm512_srlv_epi64(code_left, buf_len_v));
+          buf_len_v = _mm512_add_epi64(buf_len_v, len);
+        }
 
-#if 1
-        vec8x64 lens = len16;
-        lens = _mm512_add_epi64(lens, _mm512_srli_epi64(lens, 16));
-        lens = _mm512_add_epi64(lens, _mm512_srli_epi64(lens, 32));
-         const vec8x64 len_tot =
-               _mm512_and_epi64(lens, _mm512_set1_epi64(0xffff));
-#else
-        const vec8x64 len_tot =
-          _mm512_sub_epi64(_mm512_set1_epi64(64),
-              _mm512_add_epi64(shift4,
-                _mm512_and_epi64(shift_a, _mm512_set1_epi64(0xffff))));
-#endif
-
-#ifndef NDEBUG
-        const vec8x64 len1 = _mm512_srli_epi64(len16, 48);
-        const vec8x64 len2 = _mm512_and_epi64(_mm512_srli_epi64(len16, 32),
-                                              _mm512_set1_epi64(0xff));
-        const vec8x64 len3 = _mm512_and_epi64(_mm512_srli_epi64(len16, 16),
-                                              _mm512_set1_epi64(0xff));
-        const vec8x64 len4 = _mm512_and_epi64(len16, _mm512_set1_epi64(0xff));
-        const vec8x64 len_tot_alt = _mm512_add_epi64(
-            len1, _mm512_add_epi64(len2, _mm512_add_epi64(len3, len4)));
-        ASSERT_VEC_EQ(len_tot_alt, len_tot);
-        vec8x64 shift2_alt = _mm512_sub_epi64(_mm512_set1_epi64(16), len1);
-        vec8x64 shift3_alt = _mm512_sub_epi64(_mm512_set1_epi64(32),
-                                              _mm512_add_epi64(len1, len2));
-        vec8x64 shift4_alt = _mm512_sub_epi64(
-            _mm512_set1_epi64(48),
-            _mm512_add_epi64(len3, _mm512_add_epi64(len1, len2)));
-        ASSERT_VEC_EQ(shift2_alt, shift2);
-        ASSERT_VEC_EQ(shift3_alt, shift3);
-        ASSERT_VEC_EQ(shift4_alt, shift4);
-#endif
-
-        vec8x64 packed =
-            _mm512_and_epi64(pack16, _mm512_set1_epi64(0xffffULL << 48));
-        packed = _mm512_or_epi64(
-            packed,
-            _mm512_sllv_epi64(
-                _mm512_and_epi64(pack16, _mm512_set1_epi64(0xffffULL << 32)),
-                shift2));
-        packed = _mm512_or_epi64(
-            packed,
-            _mm512_sllv_epi64(
-                _mm512_and_epi64(pack16, _mm512_set1_epi64(0xffffULL << 16)),
-                shift3));
-        packed = _mm512_or_epi64(
-            packed, _mm512_sllv_epi64(
-                        _mm512_and_epi64(pack16, _mm512_set1_epi64(0xffffULL)),
-                        shift4));
-
-        // Add `packed` to `buf_v`
-        buf_v = _mm512_or_epi64(buf_v, _mm512_srlv_epi64(packed, buf_len_v));
-        buf_len_v = _mm512_add_epi64(buf_len_v, len_tot);
         // Flush buffer
         vec8x64 num_bytes = _mm512_srli_epi64(buf_len_v, 3);
         _mm512_i64scatter_epi64(write_base, write_v, buf_v, 1);
         write_v = _mm512_sub_epi64(write_v, num_bytes);
         // Shift these bytes out to the left from `buf_v`.
         vec8x64 written_bits =
-            _mm512_and_epi64(buf_len_v, _mm512_set1_epi64(~7));
+            _mm512_andnot_epi64(_mm512_set1_epi64(7), buf_len_v);
         buf_v = _mm512_sllv_epi64(buf_v, written_bits);
         buf_len_v = _mm512_and_epi64(buf_len_v, _mm512_set1_epi64(7));
       }
