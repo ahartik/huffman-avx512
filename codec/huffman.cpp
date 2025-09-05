@@ -197,22 +197,17 @@ vec8x64 GetWord16(vec8x64 vec) {
     case 0:
       return _mm512_and_epi64(vec, _mm512_set1_epi64(0xffffULL));
     case 1: {
-      vec64x8 ctrl = _mm512_set4_epi64(
-          0xfffffffFffff0908, 0xfffffffFffff0302,
-          0xfffffffFffff0908, 0xfffffffFffff0302);
+      vec64x8 ctrl = _mm512_set4_epi64(0xfffffffFffff0b0a, 0xfffffffFffff0302,
+                                       0xfffffffFffff0b0a, 0xfffffffFffff0302);
       return _mm512_shuffle_epi8(vec, ctrl);
     }
     case 2: {
-      vec64x8 ctrl = _mm512_set4_epi64(
-          0xfffffffFffff0b0a, 0xfffffffFffff0504,
-          0xfffffffFffff0b0a, 0xfffffffFffff0504);
+      vec64x8 ctrl = _mm512_set4_epi64(0xfffffffFffff0d0c, 0xfffffffFffff0504,
+                                       0xfffffffFffff0d0c, 0xfffffffFffff0504);
       return _mm512_shuffle_epi8(vec, ctrl);
     }
     case 3: {
-      vec64x8 ctrl = _mm512_set4_epi64(
-          0xfffffffFffff0d0c, 0xfffffffFffff0706,
-          0xfffffffFffff0d0c, 0xfffffffFffff0706);
-      return _mm512_shuffle_epi8(vec, ctrl);
+      return _mm512_srli_epi64(vec, 48);
     }
     default:
       // This should not be reached.
@@ -1140,7 +1135,7 @@ std::string CompressMultiAvx512(std::string_view raw) {
 
     // Last stripe is always one of the smallest, so we can just base our loop
     // condition on that.
-    for (size_t read_i = 0; read_i + 7 < sizes[K - 1]; read_i += 8) {
+    for (size_t read_i = 0; read_i + 7 < sizes[m * 8 + 7]; read_i += 8) {
       // Read bytes
       vec8x64 bytes = _mm512_i64gather_epi64(read_v, read_base, 1);
       read_v = _mm512_add_epi64(read_v, _mm512_set1_epi64(8));
@@ -1185,20 +1180,26 @@ std::string CompressMultiAvx512(std::string_view raw) {
         //    len16[16:31]).
         // TODO: Optimize using _mm512_shuffle_epi8
         const vec8x64 shift_a = _mm512_sub_epi64(_mm512_set1_epi16(16), len16);
-        const vec8x64 shift2 = _mm512_srli_epi64(shift_a, 48);
+        const vec8x64 shift2 =  GetWord16<3>(shift_a);
         const vec8x64 shift_sum2 =
             _mm512_add_epi64(shift_a, _mm512_srli_epi64(shift_a, 16));
-        const vec8x64 shift3 = _mm512_and_epi64(
-            _mm512_srli_epi64(shift_sum2, 32), _mm512_set1_epi64(0xff));
+        const vec8x64 shift3 = GetWord16<2>(shift_sum2);
         const vec8x64 shift_sum3 =
             _mm512_add_epi64(shift_a, _mm512_srli_epi64(shift_sum2, 16));
-        vec8x64 shift4 = _mm512_and_epi64(_mm512_srli_epi64(shift_sum3, 16),
-                                          _mm512_set1_epi64(0xff));
+        vec8x64 shift4 = GetWord16<1>(shift_sum3);
 
+#if 1
         vec8x64 lens = len16;
         lens = _mm512_add_epi64(lens, _mm512_srli_epi64(lens, 16));
         lens = _mm512_add_epi64(lens, _mm512_srli_epi64(lens, 32));
-        const vec8x64 len_tot = _mm512_and_epi64(lens, _mm512_set1_epi64(0xff));
+         const vec8x64 len_tot =
+               _mm512_and_epi64(lens, _mm512_set1_epi64(0xffff));
+#else
+        const vec8x64 len_tot =
+          _mm512_sub_epi64(_mm512_set1_epi64(64),
+              _mm512_add_epi64(shift4,
+                _mm512_and_epi64(shift_a, _mm512_set1_epi64(0xffff))));
+#endif
 
 #ifndef NDEBUG
         const vec8x64 len1 = _mm512_srli_epi64(len16, 48);

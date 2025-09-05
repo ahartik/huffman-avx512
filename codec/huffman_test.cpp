@@ -129,6 +129,7 @@ TYPED_TEST(CompressorTest, LongCodes) {
       text.push_back('A' + i);
     }
   }
+  std::shuffle(text.begin(), text.end(), std::mt19937());
   string compressed = TypeParam::Compress(text);
   string decompressed = TypeParam::Decompress(compressed);
   EXPECT_EQ(text, decompressed);
