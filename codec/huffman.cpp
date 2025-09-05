@@ -45,6 +45,48 @@ const int kMaxOptimalCodeLength = 32;
 
 #define DLOG(level) \
   if (level <= HUFF_VLOG) std::cout
+
+void MyAbort() {
+  std::cout << std::flush;
+  std::cerr << std::flush;
+  abort();
+}
+
+bool VecEqual(__m512i a, __m512i b) {
+  __mmask8 k = _mm512_cmpeq_epi64_mask(a, b);
+  uint32_t mask_i = _cvtmask8_u32(k);
+  // std::cout << "mask_i = " << mask_i << "\n";
+  return mask_i == 0xff;
+}
+
+std::string Int64VecToString(__m512i vec) {
+  uint64_t nums[8];
+  _mm512_storeu_epi64(nums, vec);
+  std::ostringstream s;
+  s << "[";
+  for (int i = 0; i < 8; ++i) {
+    s << std::format("{:016x}", nums[i]);
+    if (i != 7) {
+      s << ", ";
+    }
+  }
+  s << "]";
+  return s.str();
+}
+
+#define ASSERT_VEC_EQ(a, b)                                             \
+  do {                                                                  \
+    if (!VecEqual(a, b)) {                                              \
+      std::cout << "" #a " != " #b " :\n";                              \
+      std::cout << Int64VecToString(a) << " != " << Int64VecToString(b) \
+                << "\n";                                                \
+      MyAbort();                                                        \
+    }                                                                   \
+  } while (0)
+
+// Vector helpers:
+//
+
 }  // namespace
 
 namespace internal {
@@ -145,6 +187,38 @@ inline uint16_t ReverseBits16(uint16_t x) {
   x = ((x >> 4) & bits0f) | ((x & bits0f) << 4);
   // Reverse the two bytes:
   return (x >> 8) | (x << 8);
+}
+
+template <int W>
+vec8x64 GetWord16(vec8x64 vec) {
+  static_assert(W >= 0);
+  static_assert(W < 4);
+  switch (W) {
+    case 0:
+      return _mm512_and_epi64(vec, _mm512_set1_epi64(0xffffULL));
+    case 1: {
+      vec64x8 ctrl = _mm512_set4_epi64(
+          0xfffffffFffff0908, 0xfffffffFffff0302,
+          0xfffffffFffff0908, 0xfffffffFffff0302);
+      return _mm512_shuffle_epi8(vec, ctrl);
+    }
+    case 2: {
+      vec64x8 ctrl = _mm512_set4_epi64(
+          0xfffffffFffff0b0a, 0xfffffffFffff0504,
+          0xfffffffFffff0b0a, 0xfffffffFffff0504);
+      return _mm512_shuffle_epi8(vec, ctrl);
+    }
+    case 3: {
+      vec64x8 ctrl = _mm512_set4_epi64(
+          0xfffffffFffff0d0c, 0xfffffffFffff0706,
+          0xfffffffFffff0d0c, 0xfffffffFffff0706);
+      return _mm512_shuffle_epi8(vec, ctrl);
+    }
+    default:
+      // This should not be reached.
+      assert(false);
+      return vec;
+  }
 }
 
 struct BitCode {
@@ -924,21 +998,6 @@ std::string DecompressMulti(std::string_view compressed) {
   return DecompressMultiImpl<K, Decoder2x>(compressed);
 }
 
-std::string Int64VecToString(__m512i vec) {
-  uint64_t nums[8];
-  _mm512_storeu_epi64(nums, vec);
-  std::ostringstream s;
-  s << "[";
-  for (int i = 0; i < 8; ++i) {
-    s << std::format("{:016x}", nums[i]);
-    if (i != 7) {
-      s << ", ";
-    }
-  }
-  s << "]";
-  return s.str();
-}
-
 // Slowish method for decoding a single stream. Used to finish off decoding one
 // character at a time.
 
@@ -959,13 +1018,6 @@ void DecodeSingleStream(const UsedDecoder& decoder,
     int bits = decoder.Decode1(reader.code(), &output);
     reader.ConsumeBits(bits);
   }
-}
-
-bool VecEqual(__m512i a, __m512i b) {
-  __mmask8 k = _mm512_cmpeq_epi64_mask(a, b);
-  uint32_t mask_i = _cvtmask8_u32(k);
-  // std::cout << "mask_i = " << mask_i << "\n";
-  return mask_i == 0xff;
 }
 
 template <int K>
@@ -991,8 +1043,7 @@ std::string CompressMultiAvx512(std::string_view raw) {
   int sym_count[256] = {};
   {
     for (int k = 0; k < K; ++k) {
-      CountSymbols(raw.substr(read_index[k], sizes[k]),
-                   part_count[k].data());
+      CountSymbols(raw.substr(read_index[k], sizes[k]), part_count[k].data());
     }
     for (int k = 0; k < K; ++k) {
       for (int i = 0; i < 256; ++i) {
@@ -1057,21 +1108,23 @@ std::string CompressMultiAvx512(std::string_view raw) {
   // Instead of using look up tables, AVX-512 registers and shuffles are used.
   vec64x8 hi_v[4];
   vec64x8 lo_v[4];
-  vec64x8 len_v[4];
+  // vec64x8 len_v[4];
   {
     uint8_t hi_arr[256];
     uint8_t lo_arr[256];
-    uint8_t len_arr[256];
+    // uint8_t len_arr[256];
     for (int c = 0; c < 256; ++c) {
       uint16_t code16 = coding.codes[c].bits << (16 - kMaxCodeLength);
       hi_arr[c] = code16 >> 8;
-      lo_arr[c] = code16 & 0xff;
-      len_arr[c] = coding.codes[c].len;
+      lo_arr[c] = (code16 & 0xff) + coding.codes[c].len;
+      assert((code16 & 15) == 0);
+      assert(coding.codes[c].len <= 12);
+      // len_arr[c] = coding.codes[c].len;
     }
     for (int i = 0; i < 4; ++i) {
       hi_v[i] = _mm512_loadu_epi8(hi_arr + 64 * i);
       lo_v[i] = _mm512_loadu_epi8(lo_arr + 64 * i);
-      len_v[i] = _mm512_loadu_epi8(len_arr + 64 * i);
+      // len_v[i] = _mm512_loadu_epi8(len_arr + 64 * i);
     }
   }
 
@@ -1094,14 +1147,15 @@ std::string CompressMultiAvx512(std::string_view raw) {
       // Decode all 64 bytes simultaneously.
       vec64x8 code_hi = _mm512_permutexvar_epi8(bytes, hi_v[0]);
       vec64x8 code_lo = _mm512_permutexvar_epi8(bytes, lo_v[0]);
-      vec64x8 code_len = _mm512_permutexvar_epi8(bytes, len_v[0]);
       UNROLL8 for (int k = 1; k < 4; ++k) {
         mask64 cmp =
             _mm512_cmpge_epu8_mask(bytes, _mm512_set1_epi8(char(k * 64)));
         code_hi = _mm512_mask_permutexvar_epi8(code_hi, cmp, bytes, hi_v[k]);
         code_lo = _mm512_mask_permutexvar_epi8(code_lo, cmp, bytes, lo_v[k]);
-        code_len = _mm512_mask_permutexvar_epi8(code_len, cmp, bytes, len_v[k]);
       }
+      // Length was stored in low bits of `code_lo`
+      vec64x8 code_len = _mm512_and_si512(code_lo, _mm512_set1_epi8(0xf));
+      code_lo = _mm512_and_si512(code_lo, _mm512_set1_epi8(0xf0));
       // Now, we must rearrange and pack these codes. We'll do this by
       // processing 4 symbols for each stream at a time.
       UNROLL8 for (int j = 0; j < 2; ++j) {
@@ -1130,18 +1184,42 @@ std::string CompressMultiAvx512(std::string_view raw) {
         // 4. Bits  0:15 are shifted left by (48 - len16[48:64] - len16[32:47] -
         //    len16[16:31]).
         // TODO: Optimize using _mm512_shuffle_epi8
+        const vec8x64 shift_a = _mm512_sub_epi64(_mm512_set1_epi16(16), len16);
+        const vec8x64 shift2 = _mm512_srli_epi64(shift_a, 48);
+        const vec8x64 shift_sum2 =
+            _mm512_add_epi64(shift_a, _mm512_srli_epi64(shift_a, 16));
+        const vec8x64 shift3 = _mm512_and_epi64(
+            _mm512_srli_epi64(shift_sum2, 32), _mm512_set1_epi64(0xff));
+        const vec8x64 shift_sum3 =
+            _mm512_add_epi64(shift_a, _mm512_srli_epi64(shift_sum2, 16));
+        vec8x64 shift4 = _mm512_and_epi64(_mm512_srli_epi64(shift_sum3, 16),
+                                          _mm512_set1_epi64(0xff));
+
+        vec8x64 lens = len16;
+        lens = _mm512_add_epi64(lens, _mm512_srli_epi64(lens, 16));
+        lens = _mm512_add_epi64(lens, _mm512_srli_epi64(lens, 32));
+        const vec8x64 len_tot = _mm512_and_epi64(lens, _mm512_set1_epi64(0xff));
+
+#ifndef NDEBUG
         const vec8x64 len1 = _mm512_srli_epi64(len16, 48);
         const vec8x64 len2 = _mm512_and_epi64(_mm512_srli_epi64(len16, 32),
                                               _mm512_set1_epi64(0xff));
         const vec8x64 len3 = _mm512_and_epi64(_mm512_srli_epi64(len16, 16),
                                               _mm512_set1_epi64(0xff));
         const vec8x64 len4 = _mm512_and_epi64(len16, _mm512_set1_epi64(0xff));
-        vec8x64 shift2 = _mm512_sub_epi64(_mm512_set1_epi64(16), len1);
-        vec8x64 shift3 = _mm512_sub_epi64(_mm512_set1_epi64(32),
-                                          _mm512_add_epi64(len1, len2));
-        vec8x64 shift4 = _mm512_sub_epi64(
+        const vec8x64 len_tot_alt = _mm512_add_epi64(
+            len1, _mm512_add_epi64(len2, _mm512_add_epi64(len3, len4)));
+        ASSERT_VEC_EQ(len_tot_alt, len_tot);
+        vec8x64 shift2_alt = _mm512_sub_epi64(_mm512_set1_epi64(16), len1);
+        vec8x64 shift3_alt = _mm512_sub_epi64(_mm512_set1_epi64(32),
+                                              _mm512_add_epi64(len1, len2));
+        vec8x64 shift4_alt = _mm512_sub_epi64(
             _mm512_set1_epi64(48),
-            _mm512_add_epi64(len1, _mm512_add_epi64(len2, len3)));
+            _mm512_add_epi64(len3, _mm512_add_epi64(len1, len2)));
+        ASSERT_VEC_EQ(shift2_alt, shift2);
+        ASSERT_VEC_EQ(shift3_alt, shift3);
+        ASSERT_VEC_EQ(shift4_alt, shift4);
+#endif
 
         vec8x64 packed =
             _mm512_and_epi64(pack16, _mm512_set1_epi64(0xffffULL << 48));
@@ -1156,13 +1234,10 @@ std::string CompressMultiAvx512(std::string_view raw) {
                 _mm512_and_epi64(pack16, _mm512_set1_epi64(0xffffULL << 16)),
                 shift3));
         packed = _mm512_or_epi64(
-            packed,
-            _mm512_sllv_epi64(
-                _mm512_and_epi64(pack16, _mm512_set1_epi64(0xffffULL)),
-                shift4));
+            packed, _mm512_sllv_epi64(
+                        _mm512_and_epi64(pack16, _mm512_set1_epi64(0xffffULL)),
+                        shift4));
 
-        vec8x64 len_tot = _mm512_add_epi64(
-            len1, _mm512_add_epi64(len2, _mm512_add_epi64(len3, len4)));
         // Add `packed` to `buf_v`
         buf_v = _mm512_or_epi64(buf_v, _mm512_srlv_epi64(packed, buf_len_v));
         buf_len_v = _mm512_add_epi64(buf_len_v, len_tot);
@@ -1171,7 +1246,8 @@ std::string CompressMultiAvx512(std::string_view raw) {
         _mm512_i64scatter_epi64(write_base, write_v, buf_v, 1);
         write_v = _mm512_sub_epi64(write_v, num_bytes);
         // Shift these bytes out to the left from `buf_v`.
-        vec8x64 written_bits = _mm512_and_epi64(buf_len_v, _mm512_set1_epi64(~7));
+        vec8x64 written_bits =
+            _mm512_and_epi64(buf_len_v, _mm512_set1_epi64(~7));
         buf_v = _mm512_sllv_epi64(buf_v, written_bits);
         buf_len_v = _mm512_and_epi64(buf_len_v, _mm512_set1_epi64(7));
       }
