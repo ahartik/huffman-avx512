@@ -218,10 +218,18 @@ vec8x64 GetWord16ToTopBits(vec8x64 vec, int W) {
     case 0:
       return _mm512_slli_epi64(vec, 48);
     case 1: {
+#if 1
       vec64x8 ctrl =
           _mm512_set4_epi64(0x0b0a'FFFF'FFFF'FFFF, 0x0302'ffff'fffF'ffff,
                             0x0b0a'FFFF'FFFF'FFFF, 0x0302'ffff'fffF'ffff);
       return _mm512_shuffle_epi8(vec, ctrl);
+#else
+      // Using an extra instruction but fewer constants is a very tiny
+      // optimization for our code in particular.
+      return _mm512_and_epi64(_mm512_slli_epi64(vec, 32),
+                              _mm512_set1_epi64(0xffffULL << 48));
+
+#endif
     }
     case 2: {
 #if 1
@@ -1045,6 +1053,18 @@ void DecodeSingleStream(const UsedDecoder& decoder,
   }
 }
 
+// AVX helper macros
+
+#define DEF_ARR(type, name, val)                             \
+  type name[M];                                              \
+  do {                                                       \
+    UNROLL8 for (int m = 0; m < M; ++m) { name[m] = (val); } \
+  } while (0)
+
+#define DEF_VECS(name, val) DEF_ARR(vec8x64, name, val);
+
+#define FORM(m) UNROLL8 for (int m = 0; m < M; ++m)
+
 template <int K>
 std::string CompressMultiAvx512(std::string_view raw) {
   // This restriction could be lifted by using masks.
@@ -1156,21 +1176,20 @@ std::string CompressMultiAvx512(std::string_view raw) {
   uint64_t buf_arr[K];
   uint64_t buf_len_arr[K];
   const int M = K / 8;
-  for (int m = 0; m < M; ++m) {
-    vec8x64 buf_v = _mm512_setzero_si512();
-    vec8x64 buf_len_v = _mm512_setzero_si512();
-    vec8x64 read_v = _mm512_loadu_epi64(read_index + 8 * m);
-    vec8x64 write_v = _mm512_loadu_epi64(write_index + 8 * m);
+  DEF_VECS(buf_v, _mm512_setzero_si512());
+  DEF_VECS(buf_len_v, _mm512_setzero_si512());
+  DEF_VECS(read_v, _mm512_loadu_epi64(read_index + 8 * m));
+  DEF_VECS(write_v, _mm512_loadu_epi64(write_index + 8 * m));
 
-    // Last stripe is always one of the smallest, so we can just base our loop
-    // condition on that.
-    for (size_t read_i = 0; read_i + 7 < sizes[m * 8 + 7]; read_i += 8) {
-      const vec64x8 lohi_ctrl =
-          _mm512_set4_epi64(0x0f0e'0d0c'0706'0504, 0x0b0a'0908'0302'0100,
-                            0x0f0e'0d0c'0706'0504, 0x0b0a'0908'0302'0100);
-      vec8x64 bytes = _mm512_i64gather_epi64(read_v, read_base, 1);
-      read_v = _mm512_add_epi64(read_v, _mm512_set1_epi64(8));
-
+  // Last stripe is always one of the smallest, so we can just base our loop
+  // condition on that.
+  for (size_t read_i = 0; read_i + 7 < sizes[K - 1]; read_i += 8) {
+    const vec64x8 lohi_ctrl =
+        _mm512_set4_epi64(0x0f0e'0d0c'0706'0504, 0x0b0a'0908'0302'0100,
+                          0x0f0e'0d0c'0706'0504, 0x0b0a'0908'0302'0100);
+    DEF_VECS(bytes, _mm512_i64gather_epi64(read_v[m], read_base, 1));
+    FORM(m) {
+      read_v[m] = _mm512_add_epi64(read_v[m], _mm512_set1_epi64(8));
       // Low and high bytes of the codes are combined using
       // _mm512_unpacklo_epi8 and _mm512_unpackhi_epi8 below. For these
       // instructions to work we must move the bytes corresponding to first and
@@ -1178,23 +1197,31 @@ std::string CompressMultiAvx512(std::string_view raw) {
       //
       // By shuffling the input bytes we don't need to perform multiple
       // shuffles later.
-      bytes = _mm512_shuffle_epi8(bytes, lohi_ctrl);
+      bytes[m] = _mm512_shuffle_epi8(bytes[m], lohi_ctrl);
+    }
 
-      // Decode all 64 bytes simultaneously.
-      vec64x8 code_hi = _mm512_permutexvar_epi8(bytes, hi_v[0]);
-      vec64x8 code_lo = _mm512_permutexvar_epi8(bytes, lo_v[0]);
+    // Decode all 64 bytes simultaneously.
+    vec64x8 code_hi[M];
+    vec64x8 code_lo[M];
+    FORM(m) {
+      code_hi[m] = _mm512_permutexvar_epi8(bytes[m], hi_v[0]);
+      code_lo[m] = _mm512_permutexvar_epi8(bytes[m], lo_v[0]);
       UNROLL8 for (int k = 1; k < 4; ++k) {
         mask64 cmp =
-            _mm512_cmpge_epu8_mask(bytes, _mm512_set1_epi8(char(k * 64)));
-        code_hi = _mm512_mask_permutexvar_epi8(code_hi, cmp, bytes, hi_v[k]);
-        code_lo = _mm512_mask_permutexvar_epi8(code_lo, cmp, bytes, lo_v[k]);
+            _mm512_cmpge_epu8_mask(bytes[m], _mm512_set1_epi8(char(k * 64)));
+        code_hi[m] =
+            _mm512_mask_permutexvar_epi8(code_hi[m], cmp, bytes[m], hi_v[k]);
+        code_lo[m] =
+            _mm512_mask_permutexvar_epi8(code_lo[m], cmp, bytes[m], lo_v[k]);
       }
+    }
 
-      // Now, we must rearrange and pack these codes. We'll do this by
-      // processing 4 symbols for each stream at a time.
-      UNROLL8 for (int j = 0; j < 2; ++j) {
-        vec64x8 pack16 = j == 0 ? _mm512_unpacklo_epi8(code_lo, code_hi)
-                                : _mm512_unpackhi_epi8(code_lo, code_hi);
+    // Now, we must rearrange and pack these codes. We'll do this by
+    // processing 4 symbols for each stream at a time.
+    UNROLL8 for (int j = 0; j < 2; ++j) {
+      FORM(m) {
+        vec64x8 pack16 = j == 0 ? _mm512_unpacklo_epi8(code_lo[m], code_hi[m])
+                                : _mm512_unpackhi_epi8(code_lo[m], code_hi[m]);
         // Length was stored in low bits of `code_lo`
         vec64x8 len16 = _mm512_and_si512(pack16, _mm512_set1_epi16(0xf));
         // (Using "andnot" instead of "and" saves one register.)
@@ -1204,36 +1231,34 @@ std::string CompressMultiAvx512(std::string_view raw) {
         // the length of each code in a 16-bit word at the same position.  Next
         // we must pack the codes by shifting.
 
-        vec8x64 tmp_buf = _mm512_setzero_si512();
-        vec8x64 tmp_buf_len = _mm512_setzero_si512();
         UNROLL8 for (int z = 0; z < 4; ++z) {
           const vec64x8 len = GetWord16(len16, z);
           const vec64x8 code_left = GetWord16ToTopBits(pack16, z);
-          tmp_buf =
-              _mm512_or_epi64(tmp_buf, _mm512_srlv_epi64(code_left, tmp_buf_len));
-          tmp_buf_len = _mm512_add_epi64(tmp_buf_len, len);
+          buf_v[m] = _mm512_or_epi64(
+              buf_v[m], _mm512_srlv_epi64(code_left, buf_len_v[m]));
+          buf_len_v[m] = _mm512_add_epi64(buf_len_v[m], len);
         }
-        buf_v =
-            _mm512_or_epi64(buf_v, _mm512_srlv_epi64(tmp_buf, buf_len_v));
-        buf_len_v = _mm512_add_epi64(buf_len_v, tmp_buf_len);
 
         // Flush buffer
-        vec8x64 num_bytes = _mm512_srli_epi64(buf_len_v, 3);
-        _mm512_i64scatter_epi64(write_base, write_v, buf_v, 1);
-        write_v = _mm512_sub_epi64(write_v, num_bytes);
+        vec8x64 num_bytes = _mm512_srli_epi64(buf_len_v[m], 3);
+        _mm512_i64scatter_epi64(write_base, write_v[m], buf_v[m], 1);
+        write_v[m] = _mm512_sub_epi64(write_v[m], num_bytes);
         // Shift these bytes out to the left from `buf_v`.
         vec8x64 written_bits =
-            _mm512_andnot_epi64(_mm512_set1_epi64(7), buf_len_v);
-        buf_v = _mm512_sllv_epi64(buf_v, written_bits);
-        buf_len_v = _mm512_and_epi64(buf_len_v, _mm512_set1_epi64(7));
+            _mm512_andnot_epi64(_mm512_set1_epi64(7), buf_len_v[m]);
+        buf_v[m] = _mm512_sllv_epi64(buf_v[m], written_bits);
+        buf_len_v[m] = _mm512_and_epi64(buf_len_v[m], _mm512_set1_epi64(7));
       }
     }
-    // Store vector registers back to C arrays.
-    _mm512_storeu_epi64(buf_arr + 8 * m, buf_v);
-    _mm512_storeu_epi64(buf_len_arr + 8 * m, buf_len_v);
-    _mm512_storeu_epi64(read_index + 8 * m, read_v);
-    _mm512_storeu_epi64(write_index + 8 * m, write_v);
   }
+  FORM(m) {
+    // Store vector registers back to C arrays.
+    _mm512_storeu_epi64(buf_arr + 8 * m, buf_v[m]);
+    _mm512_storeu_epi64(buf_len_arr + 8 * m, buf_len_v[m]);
+    _mm512_storeu_epi64(read_index + 8 * m, read_v[m]);
+    _mm512_storeu_epi64(write_index + 8 * m, write_v[m]);
+  }
+
   // Write remaining bytes one stream at a time.
   for (int k = 0; k < K; ++k) {
     uint64_t buf = buf_arr[k];
@@ -1313,16 +1338,6 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
   for (int k = 0; k < K; ++k) {
     write_end[k] = write_offset[k] + sizes[k];
   }
-
-#define DEF_ARR(type, name, val)                             \
-  type name[M];                                              \
-  do {                                                       \
-    UNROLL8 for (int m = 0; m < M; ++m) { name[m] = (val); } \
-  } while (0)
-
-#define DEF_VECS(name, val) DEF_ARR(vec8x64, name, val);
-
-#define FORM(m) UNROLL8 for (int m = 0; m < M; ++m)
 
   // 8 indices for reading data
   const vec8x64 zero_v = _mm512_setzero_si512();
