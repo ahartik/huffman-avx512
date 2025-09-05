@@ -224,10 +224,17 @@ vec8x64 GetWord16ToTopBits(vec8x64 vec, int W) {
       return _mm512_shuffle_epi8(vec, ctrl);
     }
     case 2: {
+#if 1
       vec64x8 ctrl =
           _mm512_set4_epi64(0x0d0c'ffff'fffF'ffff, 0x0504'ffff'fffF'ffff,
                             0x0d0c'ffff'fffF'ffff, 0x0504'ffff'fffF'ffff);
       return _mm512_shuffle_epi8(vec, ctrl);
+#else
+      // Using an extra instruction but fewer constants is a very tiny
+      // optimization for our code in particular.
+      return _mm512_and_epi64(_mm512_slli_epi64(vec, 16),
+                              _mm512_set1_epi64(0xffffULL << 48));
+#endif
     }
     case 3: {
       return _mm512_and_epi64(vec, _mm512_set1_epi64(0xffffULL << 48));
@@ -1197,13 +1204,18 @@ std::string CompressMultiAvx512(std::string_view raw) {
         // the length of each code in a 16-bit word at the same position.  Next
         // we must pack the codes by shifting.
 
+        vec8x64 tmp_buf = _mm512_setzero_si512();
+        vec8x64 tmp_buf_len = _mm512_setzero_si512();
         UNROLL8 for (int z = 0; z < 4; ++z) {
           const vec64x8 len = GetWord16(len16, z);
           const vec64x8 code_left = GetWord16ToTopBits(pack16, z);
-          buf_v =
-              _mm512_or_epi64(buf_v, _mm512_srlv_epi64(code_left, buf_len_v));
-          buf_len_v = _mm512_add_epi64(buf_len_v, len);
+          tmp_buf =
+              _mm512_or_epi64(tmp_buf, _mm512_srlv_epi64(code_left, tmp_buf_len));
+          tmp_buf_len = _mm512_add_epi64(tmp_buf_len, len);
         }
+        buf_v =
+            _mm512_or_epi64(buf_v, _mm512_srlv_epi64(tmp_buf, buf_len_v));
+        buf_len_v = _mm512_add_epi64(buf_len_v, tmp_buf_len);
 
         // Flush buffer
         vec8x64 num_bytes = _mm512_srli_epi64(buf_len_v, 3);
