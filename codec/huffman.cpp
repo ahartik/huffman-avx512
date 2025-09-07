@@ -1,6 +1,8 @@
 #include "codec/huffman.h"
 
+#include <ammintrin.h>
 #include <arpa/inet.h>
+#include <emmintrin.h>
 #include <immintrin.h>
 #include <x86intrin.h>
 
@@ -13,6 +15,7 @@
 #include <bit>
 #include <format>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <new>
 #include <sstream>
@@ -20,6 +23,7 @@
 #include <vector>
 
 #include "codec/histogram.h"
+#include "codec/heap.h"
 
 namespace huffman {
 
@@ -112,7 +116,14 @@ namespace {
 
 using vec8x64 = __m512i;
 using vec64x8 = __m512i;
+using vec16x32 = __m512i;
+
+using vec8x32 = __m256i;
+using vec4x32 = __m128i;
+
 using mask8 = __mmask8;
+using mask16 = __mmask16;
+using mask32 = __mmask32;
 using mask64 = __mmask64;
 
 int CountBits(uint64_t x) { return __builtin_popcountll(x); }
@@ -207,26 +218,6 @@ std::ostream& operator<<(std::ostream& out, const BitCode& code) {
   return out << "]";
 }
 
-struct Node {
-  int count = 0;
-  int children[2] = {};
-  uint8_t sym = 0;
-  // Opposite order, since C++ heap is a max heap and we want
-  // to pop smallest counts first.
-  bool operator<(const Node& o) const { return count > o.count; }
-};
-
-void get_code_len(const std::vector<Node>& tree, const Node* node, int len,
-                  uint16_t* len_count) {
-  assert(len < kMaxOptimalCodeLength);
-  if (node->children[0] == node->children[1]) {
-    ++len_count[len];
-  } else {
-    get_code_len(tree, &tree[node->children[0]], len + 1, len_count);
-    get_code_len(tree, &tree[node->children[1]], len + 1, len_count);
-  }
-}
-
 void write_u32(std::string& out, uint32_t x) {
   static_assert(std::endian::native == std::endian::little,
                 "Big endian support not included, but easy to add");
@@ -315,20 +306,26 @@ void LimitCodeLengths(uint16_t* len_count) {
   assert(kraft_total == one);
 }
 
+void CollectCodeLen(int32_t children[256][2], int node, int len,
+                    uint16_t* len_count) {
+  if (node < 0) {
+    ++len_count[len];
+  } else {
+    CollectCodeLen(children, children[node][0], len + 1, len_count);
+    CollectCodeLen(children, children[node][1], len + 1, len_count);
+  }
+}
+
 CanonicalCoding MakeCanonicalCoding(const ByteHistogram& sym_count) {
   CanonicalCoding coding;
 
-  std::vector<Node> heap;
-  std::vector<Node> tree;
-  heap.reserve(256);
+  // SimdHeap heap;
+  BinaryHeap heap;
   // TODO: This too could be optimized, perhaps even using AVX.
   for (int c = 0; c < 256; ++c) {
     if (sym_count[c] != 0) {
-      Node node;
-      node.count = sym_count[c];
-      node.sym = uint8_t(c);
-      heap.push_back(node);
-      coding.sorted_syms[coding.num_syms] = node.sym;
+      heap.AddInitial(sym_count[c], -1);
+      coding.sorted_syms[coding.num_syms] = uint8_t(c);
       ++coding.num_syms;
     }
   }
@@ -336,32 +333,22 @@ CanonicalCoding MakeCanonicalCoding(const ByteHistogram& sym_count) {
     return coding;
   }
 
-  tree.reserve(heap.size());
-  std::make_heap(heap.begin(), heap.end());
+  heap.Init();
+
+  int tree_size = 0;
+  int32_t children[256][2];
   while (heap.size() > 1) {
     // Pop two elements
-    Node a = heap[0];
-    std::pop_heap(heap.begin(), heap.end());
-    heap.pop_back();
-    Node b = heap[0];
-    std::pop_heap(heap.begin(), heap.end());
-    heap.pop_back();
+    const auto a = heap.Pop();
+    const auto b = heap.Pop();
 
-    tree.push_back(a);
-    tree.push_back(b);
-
-    Node next;
-    next.count = a.count + b.count;
-    next.children[0] = tree.size() - 2;
-    next.children[1] = tree.size() - 1;
-    heap.push_back(next);
-    std::push_heap(heap.begin(), heap.end());
+    children[tree_size][0] = a.data;
+    children[tree_size][1] = b.data;
+    heap.Push(a.count + b.count, tree_size);
+    ++tree_size;
   }
-
-  get_code_len(tree, &heap[0], 0, coding.len_count);
-  for (int i = 0; i < kMaxOptimalCodeLength; ++i) {
-  }
-  // Build "canonical Huffman code".
+  const auto root = heap.Pop();
+  CollectCodeLen(children, root.data, 0, coding.len_count);
 
   // Sort the symbols in decreasing order of frequency.
   std::sort(coding.sorted_syms, coding.sorted_syms + coding.num_syms,
@@ -375,6 +362,7 @@ CanonicalCoding MakeCanonicalCoding(const ByteHistogram& sym_count) {
     }
   }
 
+  // Build "canonical Huffman code".
   ForallCodes(coding.len_count, coding.sorted_syms, coding.num_syms,
               [&coding](uint8_t sym, BitCode code) {
                 coding.codes[sym] = code;
