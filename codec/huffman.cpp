@@ -48,20 +48,20 @@ const int kMaxOptimalCodeLength = 32;
 #define DLOG(level) \
   if (level <= HUFF_VLOG) std::cout
 
-void MyAbort() {
+[[maybe_unused]] void MyAbort() {
   std::cout << std::flush;
   std::cerr << std::flush;
   abort();
 }
 
-bool VecEqual(__m512i a, __m512i b) {
+[[maybe_unused]] bool VecEqual(__m512i a, __m512i b) {
   __mmask8 k = _mm512_cmpeq_epi64_mask(a, b);
   uint32_t mask_i = _cvtmask8_u32(k);
   // std::cout << "mask_i = " << mask_i << "\n";
   return mask_i == 0xff;
 }
 
-std::string Int64VecToString(__m512i vec) {
+[[maybe_unused]] std::string Int64VecToString(__m512i vec) {
   uint64_t nums[8];
   _mm512_storeu_epi64(nums, vec);
   std::ostringstream s;
@@ -116,42 +116,6 @@ using mask8 = __mmask8;
 using mask64 = __mmask64;
 
 int CountBits(uint64_t x) { return __builtin_popcountll(x); }
-
-inline uint64_t ToBigEndian64(uint64_t x) { return __builtin_bswap64(x); }
-
-inline uint64_t FromBigEndian64(uint64_t x) { return __builtin_bswap64(x); }
-
-inline uint64_t ReverseBits64(uint64_t x) {
-  // https://graphics.stanford.edu/%7Eseander/bithacks.html#ReverseParallel
-
-  const uint64_t bits55 = 0x5555555555555555ull;
-  const uint64_t bits33 = 0x3333333333333333ull;
-  const uint64_t bits0f = 0x0f0f0f0f0f0f0f0full;
-  // Swap odd and even bits
-  x = ((x >> 1) & bits55) | ((x & bits55) << 1);
-  // swap consecutixe pairs
-  x = ((x >> 2) & bits33) | ((x & bits33) << 2);
-  // // swap nibbles ...
-  x = ((x >> 4) & bits0f) | ((x & bits0f) << 4);
-  // Bytes can be reversed with this instruction instead.
-  return __builtin_bswap64(x);
-}
-
-inline uint16_t ReverseBits16(uint16_t x) {
-  // https://graphics.stanford.edu/%7Eseander/bithacks.html#ReverseParallel
-
-  const uint16_t bits55 = 0x5555;
-  const uint16_t bits33 = 0x3333;
-  const uint16_t bits0f = 0x0f0f;
-  // Swap odd and even bits
-  x = ((x >> 1) & bits55) | ((x & bits55) << 1);
-  // swap consecutixe pairs
-  x = ((x >> 2) & bits33) | ((x & bits33) << 2);
-  // // swap nibbles ...
-  x = ((x >> 4) & bits0f) | ((x & bits0f) << 4);
-  // Reverse the two bytes:
-  return (x >> 8) | (x << 8);
-}
 
 vec8x64 GetWord16(vec8x64 vec, int W) {
   switch (W) {
