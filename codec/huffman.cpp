@@ -319,8 +319,8 @@ void CollectCodeLen(int32_t children[256][2], int node, int len,
 CanonicalCoding MakeCanonicalCoding(const ByteHistogram& sym_count) {
   CanonicalCoding coding;
 
-  // SimdHeap heap;
-  BinaryHeap heap;
+   SimdHeap heap;
+  // BinaryHeap heap;
   // TODO: This too could be optimized, perhaps even using AVX.
   for (int c = 0; c < 256; ++c) {
     if (sym_count[c] != 0) {

@@ -18,16 +18,44 @@ class SimdHeap {
   SimdHeap() {
     size_ = 0;
     std::fill(count_, count_ + 256, kEmpty);
+    std::fill(block_min_, block_min_ + 16, kEmpty);
   };
 
-  void AddInitial(uint32_t count, int32_t data) { Push(count, data); }
-  void Init() {}
-
-  void Push(uint32_t count, int32_t data) {
+  void AddInitial(uint32_t count, int32_t data) {
     assert(count < kMaxCount);
     assert(size_ < 256);
     count_[size_] = (count << 8) | size_;
     data_[size_] = data;
+    ++size_;
+  }
+
+  void Init() {
+    for (int j = 0; j < 16; ++j) {
+      block_min_[j] = GetMin16(count_ + j * 16);
+    }
+
+    // Initialize freelist.
+    next_free_ = size_;
+    for (int i = size_; i < kMaxSize; ++i) {
+      data_[i] = i + 1;
+    }
+  }
+
+  void Push(uint32_t count, int32_t data) {
+    assert(count < kMaxCount);
+    assert(size_ < 256);
+
+    // Find spot from freelist.
+    int ind = next_free_;
+    assert(ind < 256);
+    next_free_ = data_[next_free_];
+    count_[ind] = (count << 8) | ind;
+    data_[ind] = data;
+
+    // Update this block:
+    uint32_t block = ind / 16;
+    block_min_[block] = GetMin16(count_ + 16 * block);
+
     ++size_;
   }
 
@@ -36,36 +64,49 @@ class SimdHeap {
     int32_t data;
   };
 
-  CountAndData /* __attribute__ ((noinline)) */
+  CountAndData  __attribute__ ((noinline)) 
   Pop() {
-    using vec16x32 = __m512i;
-    assert(size_ > 0);
-
-    vec16x32 min16 = _mm512_loadu_epi32(count_);
-    for (int j = 16; j < size_; j += 16) {
-      min16 = _mm512_min_epu32(min16, _mm512_loadu_epi32(count_ + j));
-    }
-
-    const uint32_t min_val = _mm512_reduce_min_epu32(min16);
-    const int min_ind = min_val & 0xff;
+    const uint32_t min_val = GetMin16(block_min_);
+    const uint32_t min_ind = min_val & 0xff;
 
     CountAndData popped = {
         .count = (min_val >> 8),
         .data = data_[min_ind],
     };
     --size_;
-    count_[min_ind] = (count_[size_] & 0xFFFF'FF00) | (min_ind);
-    data_[min_ind] = data_[size_];
-    count_[size_] = kEmpty;
+
+    count_[min_ind] = kEmpty;
+    // Make `min_ind` the head of the freelist.
+    data_[min_ind] = next_free_;
+    next_free_ = min_ind;
+
+    unsigned pop_block = min_ind / 16;
+    block_min_[pop_block] = GetMin16(count_ + 16 * pop_block);
+
     return popped;
   }
+
+  // TODO: At least one call to GetMin16 can be removed for one loop of Huffman
+  // code construction: It always performs two Pop()s followed by a Push().
+  //
+  // After the second pop, we don't need to update 
+  // 
+  // 1. Find minimum item and fill that spot with kEmpty
+  // 2. Update block_min_ for that block
+  // 3. Find second 
 
   size_t size() const { return size_; }
 
  private:
+  uint32_t GetMin16(uint32_t* arr) {
+    // TODO: This could potentially be optimized too.
+    return _mm512_reduce_min_epu32(_mm512_loadu_epi32(arr));
+  }
   uint32_t count_[kMaxSize];
+  uint32_t block_min_[16];
   int32_t data_[kMaxSize];
   size_t size_;
+  int next_free_;
 };
 
 class BinaryHeap {

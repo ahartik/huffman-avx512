@@ -26,6 +26,7 @@ The code was developed and tested using an AMD Ryzen 9950X CPU.
 | AvxMulti8    |
 | AvxMulti32   |
 
+
 Here "Single" is my implementation of regular Huffman coding, where 
 My scalar code is slightly less well optimized than Huff0, resulting 
 
@@ -37,4 +38,12 @@ tables](https://www.agner.org/optimize/instruction_tables.pdf), it results in
 40 [micro-ops (μops)](https://en.wikipedia.org/wiki/Micro-operation).
 This explains the extremely low 
 
+## Breakdown of compression
 
+# Optimizations and other details
+
+## Performance of gather and scatter
+
+## Symbol counting performance
+
+## Heaps
