@@ -19,6 +19,8 @@
 #include <type_traits>
 #include <vector>
 
+#include "codec/histogram.h"
+
 namespace huffman {
 
 namespace {
@@ -87,170 +89,6 @@ std::string Int64VecToString(__m512i vec) {
 }  // namespace
 
 namespace internal {
-
-void CountSymbolsVectorized(std::string_view text, int* sym_count) {
-  // I think the () at the end of the new-expression guarantees that the array
-  // gets zeroed.
-  constexpr int NUM_ARR = 4;
-  const std::unique_ptr<std::array<uint32_t, 256>[]> tmp_count(
-      new std::array<uint32_t, 256>[NUM_ARR]());
-  assert(tmp_count[2][7] == 0);
-  const size_t text_size = text.size();
-  const uint8_t* ptr = reinterpret_cast<const uint8_t*>(text.data());
-  const uint8_t* end = ptr + text_size;
-  if (ptr + 16 < end) {
-    __m128i nextVec = _mm_loadu_si128((const __m128i*)ptr);
-    ptr += 16;
-    while (ptr + 16 < end) {
-      __m128i vec = nextVec;
-      nextVec = _mm_loadu_si128((const __m128i*)ptr);
-      ptr += 16;
-
-      // TODO: This can also be achieved using C++ templates.
-#if 0
-#define ADD_ONE(j)                         \
-  do {                                     \
-    uint64_t b = _mm_extract_epi8(vec, j); \
-    ++tmp_count[j % NUM_ARR][b];                     \
-  } while (0)
-
-      // clang-format off
-      ADD_ONE(0); ADD_ONE(1); ADD_ONE(2); ADD_ONE(3);
-      ADD_ONE(4); ADD_ONE(5); ADD_ONE(6); ADD_ONE(7);
-      ADD_ONE(8); ADD_ONE(9); ADD_ONE(10); ADD_ONE(11);
-      ADD_ONE(12); ADD_ONE(13); ADD_ONE(14); ADD_ONE(15);
-      // clang-format on
-#undef ADD_ONE
-#elif 1
-
-#define ADD_TWO(j)                        \
-  do {                                     \
-    uint16_t b = _mm_extract_epi16(vec, j);\
-    ++tmp_count[(j*2) % NUM_ARR][b & 0xff];            \
-    ++tmp_count[(j*2+1) % NUM_ARR][(b>>8) & 0xff];     \
-  } while (0)
-
-      // clang-format off
-      ADD_TWO(0); ADD_TWO(1); ADD_TWO(2); ADD_TWO(3);
-      ADD_TWO(4); ADD_TWO(5); ADD_TWO(6); ADD_TWO(7);
-      // clang-format on
-#undef ADD_TWO
-
-#else
-
-#define ADD_FOUR(j)                        \
-  do {                                     \
-    uint32_t b = _mm_extract_epi32(vec, j);\
-    ++tmp_count[j*4][b & 0xff];            \
-    ++tmp_count[j*4+1][(b>>8) & 0xff];     \
-    ++tmp_count[j*4+2][(b>>16) & 0xff];     \
-    ++tmp_count[j*4+3][(b>>24) & 0xff];     \
-  } while (0)
-      // clang-format off
-      ADD_FOUR(0); ADD_FOUR(1); ADD_FOUR(2); ADD_FOUR(3);
-      // clang-format on
-#undef ADD_FOUR
-#endif
-    }
-    ptr -= 16;
-  }
-
-  while (ptr < end) {
-    ++tmp_count[0][*ptr++];
-  }
-  // TODO: Vectorize this
-  for (int c = 0; c < 256; ++c) {
-    sym_count[c] = 0;
-    UNROLL8 for (int j = 0; j < NUM_ARR; ++j) { sym_count[c] += tmp_count[j][c]; }
-  }
-}
-
-// This is not very fast :(
-void CountSymbolsGatherScatter(std::string_view text, int* sym_count) {
-  // I think the () at the end of the new-expression guarantees that the array
-  // gets zeroed.
-  const std::unique_ptr<uint32_t[]> tmp_count(new uint32_t[16 * 256]());
-  assert(tmp_count[27] == 0);
-  const size_t text_size = text.size();
-  const uint8_t* ptr = reinterpret_cast<const uint8_t*>(text.data());
-  const uint8_t* end = ptr + text_size;
-
-  uint32_t index_offset[16];
-  for (int i = 0; i < 16; ++i) {
-    index_offset[i] = 256 * i;
-  }
-  const __m512i offset_v = _mm512_loadu_epi16(index_offset);
-  const __m512i one32 = _mm512_set1_epi32(1);
-  while (ptr + 16 < end) {
-    __m128i bytes = _mm_loadu_si128((const __m128i*)ptr);
-    ptr += 16;
-    __m512i index = _mm512_cvtepu8_epi32(bytes);
-    index = _mm512_add_epi32(index, offset_v);
-
-    __m512i cnt = _mm512_i32gather_epi32(index, tmp_count.get(), 4);
-    cnt = _mm512_add_epi32(cnt, one32);
-
-    _mm512_i32scatter_epi32(tmp_count.get(), index, cnt, 4);
-  }
-
-  while (ptr < end) {
-    ++tmp_count[*ptr++];
-  }
-  // TODO: Vectorize this
-  for (int c = 0; c < 256; ++c) {
-    sym_count[c] = 0;
-    UNROLL8 for (int j = 0; j < 16; ++j) { sym_count[c] += tmp_count[j * 256 + c]; }
-  }
-}
-
-void CountSymbols(std::string_view text, int* sym_count) {
-  // Idea copied from Huff0: count in four stripes to maximize superscalar
-  if (text.size() < 1500) {
-    const size_t text_size = text.size();
-    for (size_t i = 0; i < text_size; ++i) {
-      ++sym_count[uint8_t(text[i])];
-    }
-  } else {
-#if 0
-     CountSymbolsVectorized(text, sym_count);
-    // CountSymbolsGatherScatter(text, sym_count);
-#else
-    // It's not exactly clear if 64 or 32 bits is faster here.
-    using WordType = uint32_t;
-    constexpr int WORD_BYTES = sizeof(WordType);
-    constexpr int NUM_ARR = 4;
-    uint32_t tmp_count[NUM_ARR][256] = {};
-    const size_t text_size = text.size();
-    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(text.data());
-    const uint8_t* end = ptr + text_size;
-
-    if (ptr + WORD_BYTES - 1 < end) {
-      WordType cached;
-      memcpy(&cached, ptr, WORD_BYTES);
-      ptr += WORD_BYTES;
-      // Unrolling here didn't seem to make it faster.
-      while (ptr + WORD_BYTES - 1 < end) {
-        WordType data = cached;
-        memcpy(&cached, ptr, WORD_BYTES);
-        ptr += WORD_BYTES;
-        UNROLL8 for (int j = 0; j < WORD_BYTES; ++j) {
-          ++tmp_count[j % NUM_ARR][(data >> (j * 8)) & 0xff];
-        }
-      }
-      ptr -= WORD_BYTES;
-    }
-    while (ptr < end) {
-      ++tmp_count[0][*ptr++];
-    }
-    for (int c = 0; c < 256; ++c) {
-      sym_count[c] = 0;
-      for (int j = 0; j < NUM_ARR; ++j) {
-        sym_count[c] += tmp_count[j][c];
-      }
-    }
-#endif
-  }
-}
 
 // Returns the sizes of slices
 template <int K>
@@ -416,7 +254,7 @@ struct Node {
 
 void get_code_len(const std::vector<Node>& tree, const Node* node, int len,
                   uint16_t* len_count) {
-  assert (len < kMaxOptimalCodeLength);
+  assert(len < kMaxOptimalCodeLength);
   if (node->children[0] == node->children[1]) {
     ++len_count[len];
   } else {
@@ -513,7 +351,7 @@ void LimitCodeLengths(uint16_t* len_count) {
   assert(kraft_total == one);
 }
 
-CanonicalCoding MakeCanonicalCoding(const int* sym_count) {
+CanonicalCoding MakeCanonicalCoding(const ByteHistogram& sym_count) {
   CanonicalCoding coding;
 
   std::vector<Node> heap;
@@ -848,14 +686,13 @@ class Decoder2x {
 }  // namespace
 
 std::string Compress(std::string_view raw) {
-  int sym_count[256] = {};
-  CountSymbols(raw, sym_count);
-  CanonicalCoding coding = MakeCanonicalCoding(sym_count);
+  auto hist = MakeHistogram(raw);
+  CanonicalCoding coding = MakeCanonicalCoding(hist);
 
   uint64_t output_bits = 0;
   for (int i = 0; i < coding.num_syms; ++i) {
     uint8_t sym = coding.sorted_syms[i];
-    output_bits += coding.codes[sym].len * sym_count[sym];
+    output_bits += coding.codes[sym].len * hist[sym];
   }
 
   std::string compressed;
@@ -931,13 +768,10 @@ ParsedHeader ParseCompressedHeader(std::string_view& compressed) {
   return header;
 }
 
-
 template <typename UsedDecoder>
 std::string DecompressImpl(std::string_view compressed) {
   const auto header = ParseCompressedHeader(compressed);
-  UsedDecoder decoder(
-      header.len_count, header.syms,
-      header.num_syms);
+  UsedDecoder decoder(header.len_count, header.syms, header.num_syms);
 
   std::string raw(header.raw_size, 0);
   CodeReader reader(compressed.data(), compressed.data() + compressed.size());
@@ -987,22 +821,20 @@ std::string CompressMulti(std::string_view raw) {
   // Count symbols in each component.
   // (I think this performs "value-initialization" on std::array elements,
   // which means the counts are set to zero.)
-  std::vector<std::array<int, 256>> part_count(K);
-  assert(part_count[0][7] == 0);
-  int sym_count[256] = {};
+  std::vector<ByteHistogram> part_hist(K);
+  ByteHistogram total_hist = {};
   {
     for (int k = 0; k < K; ++k) {
-      CountSymbols(std::string_view(
-                       reinterpret_cast<const char*>(part_input[k]), sizes[k]),
-                   part_count[k].data());
+      part_hist[k] = MakeHistogram(std::string_view(
+          reinterpret_cast<const char*>(part_input[k]), sizes[k]));
     }
     for (int k = 0; k < K; ++k) {
       for (int i = 0; i < 256; ++i) {
-        sym_count[i] += part_count[k][i];
+        total_hist[i] += part_hist[k][i];
       }
     }
   }
-  CanonicalCoding coding = MakeCanonicalCoding(sym_count);
+  CanonicalCoding coding = MakeCanonicalCoding(total_hist);
 
   const int kSlop = 8;
   // Compute starting positions for each part in the output.
@@ -1012,7 +844,7 @@ std::string CompressMulti(std::string_view raw) {
     for (int part = 0; part < K; ++part) {
       int64_t num_bits = 0;
       for (int c = 0; c < 256; ++c) {
-        num_bits += part_count[part][c] * coding.codes[c].len;
+        num_bits += part_hist[part][c] * coding.codes[c].len;
       }
       pos += sizes[part];
       end_offset[part] = (num_bits + 7) / 8 + kSlop;
@@ -1090,9 +922,7 @@ std::string CompressMulti(std::string_view raw) {
 template <int K, typename UsedDecoder>
 std::string DecompressMultiImpl(std::string_view compressed) {
   const auto header = ParseCompressedHeader(compressed);
-  UsedDecoder decoder(
-      header.len_count, header.syms,
-      header.num_syms);
+  UsedDecoder decoder(header.len_count, header.syms, header.num_syms);
 
   int end_offset[K] = {};
   for (int k = 0; k < K - 1; ++k) {
@@ -1218,20 +1048,19 @@ std::string CompressMultiAvx512(std::string_view raw) {
   // Count symbols in each component.
   // (I think this performs "value-initialization" on std::array elements,
   // which means the counts are set to zero.)
-  std::vector<std::array<int, 256>> part_count(K);
-  assert(part_count[0][7] == 0);
-  int sym_count[256] = {};
+  std::vector<ByteHistogram> part_hist(K);
+  ByteHistogram total_hist = {};
   {
     for (int k = 0; k < K; ++k) {
-      CountSymbols(raw.substr(read_index[k], sizes[k]), part_count[k].data());
+      part_hist[k] = MakeHistogram(raw.substr(read_index[k], sizes[k]));
     }
     for (int k = 0; k < K; ++k) {
       for (int i = 0; i < 256; ++i) {
-        sym_count[i] += part_count[k][i];
+        total_hist[i] += part_hist[k][i];
       }
     }
   }
-  CanonicalCoding coding = MakeCanonicalCoding(sym_count);
+  CanonicalCoding coding = MakeCanonicalCoding(total_hist);
 
   const int kSlop = 8;
   // Compute starting positions for each part in the output.
@@ -1241,7 +1070,7 @@ std::string CompressMultiAvx512(std::string_view raw) {
     for (int part = 0; part < K; ++part) {
       int64_t num_bits = 0;
       for (int c = 0; c < 256; ++c) {
-        num_bits += part_count[part][c] * coding.codes[c].len;
+        num_bits += part_hist[part][c] * coding.codes[c].len;
       }
       pos += sizes[part];
       write_end[part] = (num_bits + 7) / 8 + kSlop;
@@ -1419,9 +1248,7 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
   static_assert(K % 8 == 0);
   constexpr int M = K / 8;
   const auto header = ParseCompressedHeader(compressed);
-  UsedDecoder decoder(
-      header.len_count, header.syms,
-      header.num_syms);
+  UsedDecoder decoder(header.len_count, header.syms, header.num_syms);
 
   uint64_t read_end_offset[K] = {};
   for (int k = 0; k < K - 1; ++k) {

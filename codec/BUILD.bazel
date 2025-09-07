@@ -2,14 +2,8 @@ cc_library(
   name = "huffman",
   srcs = ["huffman.cpp"],
   hdrs = ["huffman.h"],
-)
-
-cc_library(
-  name = "huff0",
-  srcs = ["huff0.cpp"],
-  hdrs = ["huff0.h"],
   deps = [
-    "@finite_state_entropy//:lib",
+    ":histogram",
   ]
 )
 
@@ -32,4 +26,39 @@ cc_binary(
     "@google_benchmark//:benchmark_main"
   ],
 )
+
+
+cc_library(
+  name = "histogram",
+  srcs = ["histogram.cpp"],
+  hdrs = ["histogram.h"],
+)
+
+cc_test(
+  name =  "histogram_test",
+  srcs = ["histogram_test.cpp"],
+  deps = [
+    ":histogram",
+    "@googletest//:gtest_main"
+  ],
+)
+
+cc_binary(
+  name = "histogram_benchmark",
+  srcs = ["histogram_benchmark.cpp"],
+  deps = [
+    ":histogram",
+    "@google_benchmark//:benchmark_main"
+  ],
+)
+
+cc_library(
+  name = "huff0",
+  srcs = ["huff0.cpp"],
+  hdrs = ["huff0.h"],
+  deps = [
+    "@finite_state_entropy//:lib",
+  ]
+)
+
 
