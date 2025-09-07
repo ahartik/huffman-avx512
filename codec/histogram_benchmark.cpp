@@ -1,6 +1,5 @@
 #include "codec/histogram.h"
 
-#include <cstdint>
 #include <cstdlib>
 
 #include <string>

@@ -15,7 +15,7 @@ ByteHistogram MakeHistogramVectorized(std::string_view text) {
   // I think the () at the end of the new-expression guarantees that the array
   // gets zeroed.
   ByteHistogram sym_count = {};
-  constexpr int NUM_ARR = 4;
+  constexpr int NUM_ARR = 8;
   const std::unique_ptr<std::array<uint32_t, 256>[]> tmp_count(
       new std::array<uint32_t, 256>[NUM_ARR]());
   assert(tmp_count[2][7] == 0);
@@ -31,7 +31,7 @@ ByteHistogram MakeHistogramVectorized(std::string_view text) {
       ptr += 16;
 
       // TODO: This can also be achieved using C++ templates.
-#if 0
+#if 1
 #define ADD_ONE(j)                         \
   do {                                     \
     uint64_t b = _mm_extract_epi8(vec, j); \
@@ -45,7 +45,7 @@ ByteHistogram MakeHistogramVectorized(std::string_view text) {
       ADD_ONE(12); ADD_ONE(13); ADD_ONE(14); ADD_ONE(15);
       // clang-format on
 #undef ADD_ONE
-#elif 1
+#elif 0
 
 #define ADD_TWO(j)                                       \
   do {                                                   \
@@ -62,13 +62,13 @@ ByteHistogram MakeHistogramVectorized(std::string_view text) {
 
 #else
 
-#define ADD_FOUR(j)                           \
-  do {                                        \
-    uint32_t b = _mm_extract_epi32(vec, j);   \
-    ++tmp_count[j * 4][b & 0xff];             \
-    ++tmp_count[j * 4 + 1][(b >> 8) & 0xff];  \
-    ++tmp_count[j * 4 + 2][(b >> 16) & 0xff]; \
-    ++tmp_count[j * 4 + 3][(b >> 24) & 0xff]; \
+#define ADD_FOUR(j)                                       \
+  do {                                                    \
+    uint32_t b = _mm_extract_epi32(vec, j);               \
+    ++tmp_count[(j * 4) % NUM_ARR][b & 0xff];             \
+    ++tmp_count[(j * 4 + 1) % NUM_ARR][(b >> 8) & 0xff];  \
+    ++tmp_count[(j * 4 + 2) % NUM_ARR][(b >> 16) & 0xff]; \
+    ++tmp_count[(j * 4 + 3) % NUM_ARR][(b >> 24) & 0xff]; \
   } while (0)
       // clang-format off
       ADD_FOUR(0); ADD_FOUR(1); ADD_FOUR(2); ADD_FOUR(3);
@@ -82,7 +82,6 @@ ByteHistogram MakeHistogramVectorized(std::string_view text) {
   while (ptr < end) {
     ++tmp_count[0][*ptr++];
   }
-  // TODO: Vectorize this
   for (int c = 0; c < 256; ++c) {
     sym_count[c] = 0;
     UNROLL8 for (int j = 0; j < NUM_ARR; ++j) {
@@ -107,6 +106,9 @@ ByteHistogram MakeHistogramGatherScatter(std::string_view text) {
   for (int i = 0; i < 16; ++i) {
     index_offset[i] = 256 * i;
   }
+  // Each element in the incremented vector is stored to a separate 256-element
+  // array, since otherwise there could be collisions. These arrays are summed
+  // together in the end.
   const __m512i offset_v = _mm512_loadu_epi16(index_offset);
   const __m512i one32 = _mm512_set1_epi32(1);
   if (ptr + 16 < end) {
@@ -116,8 +118,8 @@ ByteHistogram MakeHistogramGatherScatter(std::string_view text) {
       __m128i bytes = cached;
       cached = _mm_loadu_si128((const __m128i*)ptr);
       ptr += 16;
-      __m512i index = _mm512_cvtepu8_epi32(bytes);
-      index = _mm512_add_epi32(index, offset_v);
+      const __m512i index =
+          _mm512_add_epi32(offset_v, _mm512_cvtepu8_epi32(bytes));
 
       __m512i cnt = _mm512_i32gather_epi32(index, tmp_count.get(), 4);
       cnt = _mm512_add_epi32(cnt, one32);
@@ -194,7 +196,7 @@ ByteHistogram MakeHistogram(std::string_view text) {
   if (text.size() < 1500) {
     return MakeHistogramSimple(text);
   } else {
-    return MakeHistogramMulti(text);
+    return MakeHistogramVectorized(text);
   }
 }
 }  // namespace huffman
