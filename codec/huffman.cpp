@@ -91,8 +91,9 @@ namespace internal {
 void CountSymbolsVectorized(std::string_view text, int* sym_count) {
   // I think the () at the end of the new-expression guarantees that the array
   // gets zeroed.
+  constexpr int NUM_ARR = 4;
   const std::unique_ptr<std::array<uint32_t, 256>[]> tmp_count(
-      new std::array<uint32_t, 256>[16]());
+      new std::array<uint32_t, 256>[NUM_ARR]());
   assert(tmp_count[2][7] == 0);
   const size_t text_size = text.size();
   const uint8_t* ptr = reinterpret_cast<const uint8_t*>(text.data());
@@ -106,11 +107,11 @@ void CountSymbolsVectorized(std::string_view text, int* sym_count) {
       ptr += 16;
 
       // TODO: This can also be achieved using C++ templates.
-#if 1
+#if 0
 #define ADD_ONE(j)                         \
   do {                                     \
     uint64_t b = _mm_extract_epi8(vec, j); \
-    ++tmp_count[j][b];                     \
+    ++tmp_count[j % NUM_ARR][b];                     \
   } while (0)
 
       // clang-format off
@@ -120,13 +121,13 @@ void CountSymbolsVectorized(std::string_view text, int* sym_count) {
       ADD_ONE(12); ADD_ONE(13); ADD_ONE(14); ADD_ONE(15);
       // clang-format on
 #undef ADD_ONE
-#elif 0
+#elif 1
 
 #define ADD_TWO(j)                        \
   do {                                     \
     uint16_t b = _mm_extract_epi16(vec, j);\
-    ++tmp_count[j*2][b & 0xff];            \
-    ++tmp_count[j*2+1][(b>>8) & 0xff];     \
+    ++tmp_count[(j*2) % NUM_ARR][b & 0xff];            \
+    ++tmp_count[(j*2+1) % NUM_ARR][(b>>8) & 0xff];     \
   } while (0)
 
       // clang-format off
@@ -160,7 +161,7 @@ void CountSymbolsVectorized(std::string_view text, int* sym_count) {
   // TODO: Vectorize this
   for (int c = 0; c < 256; ++c) {
     sym_count[c] = 0;
-    UNROLL8 for (int j = 0; j < 16; ++j) { sym_count[c] += tmp_count[j][c]; }
+    UNROLL8 for (int j = 0; j < NUM_ARR; ++j) { sym_count[c] += tmp_count[j][c]; }
   }
 }
 
@@ -210,31 +211,40 @@ void CountSymbols(std::string_view text, int* sym_count) {
       ++sym_count[uint8_t(text[i])];
     }
   } else {
-    // CountSymbolsVectorized(text, sym_count);
+#if 0
+     CountSymbolsVectorized(text, sym_count);
     // CountSymbolsGatherScatter(text, sym_count);
-#if 1
-    // 4K, hopefully still fits on the stack.
-    
-    int tmp_count[8][256] = {};
+#else
+    // It's not exactly clear if 64 or 32 bits is faster here.
+    using WordType = uint32_t;
+    constexpr int WORD_BYTES = sizeof(WordType);
+    constexpr int NUM_ARR = 4;
+    uint32_t tmp_count[NUM_ARR][256] = {};
     const size_t text_size = text.size();
     const uint8_t* ptr = reinterpret_cast<const uint8_t*>(text.data());
     const uint8_t* end = ptr + text_size;
-    // Unrolling here is a very very small improvement
-#pragma GCC unroll 4
-    while (ptr + 7 < end) {
-      // Four bytes at a time is slightly faster than 8.
-      uint64_t data;
-      memcpy(&data, ptr, 8);
-      ptr += 8;
-      UNROLL8 for (int j = 0; j < 8; ++j) {
-        ++tmp_count[j][(data >> (j * 8)) & 0xff];
+
+    if (ptr + WORD_BYTES - 1 < end) {
+      WordType cached;
+      memcpy(&cached, ptr, WORD_BYTES);
+      ptr += WORD_BYTES;
+      // Unrolling here didn't seem to make it faster.
+      while (ptr + WORD_BYTES - 1 < end) {
+        WordType data = cached;
+        memcpy(&cached, ptr, WORD_BYTES);
+        ptr += WORD_BYTES;
+        UNROLL8 for (int j = 0; j < WORD_BYTES; ++j) {
+          ++tmp_count[j % NUM_ARR][(data >> (j * 8)) & 0xff];
+        }
       }
+      ptr -= WORD_BYTES;
     }
     while (ptr < end) {
       ++tmp_count[0][*ptr++];
     }
     for (int c = 0; c < 256; ++c) {
-      for (int j = 0; j < 8; ++j) {
+      sym_count[c] = 0;
+      for (int j = 0; j < NUM_ARR; ++j) {
         sym_count[c] += tmp_count[j][c];
       }
     }
@@ -405,7 +415,8 @@ struct Node {
 };
 
 void get_code_len(const std::vector<Node>& tree, const Node* node, int len,
-                  uint8_t* len_count) {
+                  uint16_t* len_count) {
+  assert (len < kMaxOptimalCodeLength);
   if (node->children[0] == node->children[1]) {
     ++len_count[len];
   } else {
@@ -433,7 +444,7 @@ uint32_t read_u32(std::string_view& in) {
 // code. `func` should have signature bool(uint8_t sym, BitCode code).
 // If `func` returns false, the iteration is stopped.
 template <typename Func>
-void ForallCodes(const uint8_t* len_count, const uint8_t* syms, int num_syms,
+void ForallCodes(const uint16_t* len_count, const uint8_t* syms, int num_syms,
                  Func func) {
   uint32_t current_code = 0;
   uint64_t current_inc = 1ull << kMaxCodeLength;
@@ -462,14 +473,14 @@ struct CanonicalCoding {
   BitCode codes[256];
   uint8_t sorted_syms[256] = {};
   int num_syms = 0;
-  uint8_t len_count[kMaxOptimalCodeLength + 1] = {};
+  uint16_t len_count[kMaxOptimalCodeLength + 1] = {};
   uint32_t len_mask = 0;
 };
 
 // Tweak code lens to reduce max length to kMaxCodeLength.
 // This uses the "MiniZ" method as described in
 // https://create.stephan-brumme.com/length-limited-prefix-codes/#miniz
-void LimitCodeLengths(uint8_t* len_count) {
+void LimitCodeLengths(uint16_t* len_count) {
   bool adjustment_required = 0;
   for (int i = kMaxCodeLength + 1; i <= kMaxOptimalCodeLength; ++i) {
     adjustment_required |= len_count[i] > 0;
@@ -499,6 +510,7 @@ void LimitCodeLengths(uint8_t* len_count) {
     }
     --kraft_total;
   }
+  assert(kraft_total == one);
 }
 
 CanonicalCoding MakeCanonicalCoding(const int* sym_count) {
@@ -545,6 +557,8 @@ CanonicalCoding MakeCanonicalCoding(const int* sym_count) {
   }
 
   get_code_len(tree, &heap[0], 0, coding.len_count);
+  for (int i = 0; i < kMaxOptimalCodeLength; ++i) {
+  }
   // Build "canonical Huffman code".
 
   // Sort the symbols in decreasing order of frequency.
@@ -721,7 +735,7 @@ struct DecodedSym {
 
 class Decoder1x {
  public:
-  Decoder1x(const uint8_t* len_count, const uint8_t* syms, int num_syms)
+  Decoder1x(const uint16_t* len_count, const uint8_t* syms, int num_syms)
       : dtable_((1 << kMaxCodeLength) + 4) {
     DLOG(1) << "Decoder1x:\n";
     ForallCodes(len_count, syms, num_syms, [this](uint8_t sym, BitCode code) {
@@ -760,6 +774,8 @@ class Decoder1x {
 };
 
 struct alignas(4) DecodedSym2x {
+  // The order of bytes in memory is relied upon by the AVX512 code, so cannot
+  // be changed without changing the AVX decoder as well.
   uint8_t num_bits_decoded;
   uint8_t syms[2];
   uint8_t num_syms;
@@ -767,7 +783,7 @@ struct alignas(4) DecodedSym2x {
 
 class Decoder2x {
  public:
-  Decoder2x(const uint8_t* len_count, const uint8_t* syms, int num_syms)
+  Decoder2x(const uint16_t* len_count, const uint8_t* syms, int num_syms)
       : single_(len_count, syms, num_syms),
         dtable_(new  // (std::align_val_t(64))
                 DecodedSym2x[(1 << kMaxCodeLength) + 4]) {
@@ -849,9 +865,9 @@ std::string Compress(std::string_view raw) {
     // SPECIAL CASE FOR EMPTY STRING:
   }
   write_u32(compressed, coding.len_mask);
-  for (uint8_t count : coding.len_count) {
+  for (uint16_t count : coding.len_count) {
     if (count != 0) {
-      compressed.push_back(count);
+      compressed.push_back(uint8_t(count));
     }
   }
   compressed.append(reinterpret_cast<char*>(coding.sorted_syms),
@@ -885,35 +901,49 @@ std::string Compress(std::string_view raw) {
   return compressed;
 }
 
-template <typename UsedDecoder>
-std::string DecompressImpl(std::string_view compressed) {
-  // Build codebook.
-  const uint32_t raw_size = read_u32(compressed);
+struct ParsedHeader {
+  uint32_t raw_size;
+  uint16_t len_count[kMaxCodeLength + 1];
+  const uint8_t* syms;
+  int num_syms;
+};
+ParsedHeader ParseCompressedHeader(std::string_view& compressed) {
+  // TODO: Validate header too, to prevent crashes on bad data.
+  ParsedHeader header = {};
+  header.raw_size = read_u32(compressed);
   const uint32_t len_mask = read_u32(compressed);
-  uint8_t len_count[32] = {};
-  int num_syms = 0;
-  for (int i = 0; i < 32; ++i) {
+
+  const bool one_size = CountBits(len_mask) == 1;
+  for (int i = 0; i <= kMaxCodeLength; ++i) {
     if (len_mask & (1 << i)) {
-      len_count[i] = uint8_t(compressed[0]);
+      header.len_count[i] = uint8_t(compressed[0]);
+      if (one_size && compressed[0] == 0) {
+        // std::cout << "ALL 8 BITS\n" << std::flush;
+        assert(i == 8);
+        header.len_count[i] = 256;
+      }
       compressed.remove_prefix(1);
-      num_syms += len_count[i];
+      header.num_syms += header.len_count[i];
     }
   }
-  if (num_syms == 1) {
-    // Output consists of a single symbol only.
-    // This causes troubles in decoder, since the symbol is encoded using 0
-    // bits. We can just handle this case by itself:
-    return std::string(raw_size, compressed[0]);
-  }
-  UsedDecoder decoder(
-      len_count, reinterpret_cast<const uint8_t*>(compressed.data()), num_syms);
-  compressed.remove_prefix(num_syms);
+  header.syms = reinterpret_cast<const uint8_t*>(compressed.data());
+  compressed.remove_prefix(header.num_syms);
+  return header;
+}
 
-  std::string raw(raw_size, 0);
+
+template <typename UsedDecoder>
+std::string DecompressImpl(std::string_view compressed) {
+  const auto header = ParseCompressedHeader(compressed);
+  UsedDecoder decoder(
+      header.len_count, header.syms,
+      header.num_syms);
+
+  std::string raw(header.raw_size, 0);
   CodeReader reader(compressed.data(), compressed.data() + compressed.size());
 
   uint8_t* output = reinterpret_cast<uint8_t*>(raw.data());
-  uint8_t* output_end = output + raw_size;
+  uint8_t* output_end = output + raw.size();
   // Four symbols at a time
   bool readers_good = true;
 
@@ -1059,21 +1089,10 @@ std::string CompressMulti(std::string_view raw) {
 
 template <int K, typename UsedDecoder>
 std::string DecompressMultiImpl(std::string_view compressed) {
-  const uint32_t raw_size = read_u32(compressed);
-  const uint32_t len_mask = read_u32(compressed);
-  uint8_t len_count[32] = {};
-  int num_syms = 0;
-  for (int i = 0; i < 32; ++i) {
-    if (len_mask & (1 << i)) {
-      len_count[i] = uint8_t(compressed[0]);
-      compressed.remove_prefix(1);
-      num_syms += len_count[i];
-    }
-  }
-
+  const auto header = ParseCompressedHeader(compressed);
   UsedDecoder decoder(
-      len_count, reinterpret_cast<const uint8_t*>(&compressed[0]), num_syms);
-  compressed.remove_prefix(num_syms);
+      header.len_count, header.syms,
+      header.num_syms);
 
   int end_offset[K] = {};
   for (int k = 0; k < K - 1; ++k) {
@@ -1081,7 +1100,7 @@ std::string DecompressMultiImpl(std::string_view compressed) {
   }
   end_offset[K - 1] = compressed.size();
 
-  const auto sizes = SliceSizes<K>(raw_size);
+  const auto sizes = SliceSizes<K>(header.raw_size);
   for (size_t i = 0; i < K; ++i) {
     DLOG(1) << std::format("sizes[{}] = {}\n", i, sizes[i]);
   }
@@ -1094,7 +1113,7 @@ std::string DecompressMultiImpl(std::string_view compressed) {
     reader[k].Init(compressed.data(), compressed.data() + end_offset[k]);
   }
 
-  std::string raw(raw_size, 0);
+  std::string raw(header.raw_size, 0);
   uint8_t* part_output[K];
   uint8_t* part_end[K];
   part_output[0] = reinterpret_cast<uint8_t*>(raw.data());
@@ -1399,21 +1418,10 @@ template <int K, typename UsedDecoder>
 std::string DecompressMultiAvx512Impl(std::string_view compressed) {
   static_assert(K % 8 == 0);
   constexpr int M = K / 8;
-  const uint32_t raw_size = read_u32(compressed);
-  const uint32_t len_mask = read_u32(compressed);
-  uint8_t len_count[32] = {};
-  int num_syms = 0;
-  for (int i = 0; i < 32; ++i) {
-    if (len_mask & (1 << i)) {
-      len_count[i] = uint8_t(compressed[0]);
-      compressed.remove_prefix(1);
-      num_syms += len_count[i];
-    }
-  }
-
+  const auto header = ParseCompressedHeader(compressed);
   UsedDecoder decoder(
-      len_count, reinterpret_cast<const uint8_t*>(&compressed[0]), num_syms);
-  compressed.remove_prefix(num_syms);
+      header.len_count, header.syms,
+      header.num_syms);
 
   uint64_t read_end_offset[K] = {};
   for (int k = 0; k < K - 1; ++k) {
@@ -1423,12 +1431,12 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
 
   int sizes[K] = {};
   for (int i = 0; i < K; ++i) {
-    sizes[i] = raw_size / K;
+    sizes[i] = header.raw_size / K;
   }
-  for (size_t i = 0; i < raw_size % K; ++i) {
+  for (size_t i = 0; i < header.raw_size % K; ++i) {
     ++sizes[i];
   }
-  std::string raw(raw_size, 0);
+  std::string raw(header.raw_size, 0);
   const uint8_t* const read_base =
       reinterpret_cast<const uint8_t*>(compressed.data());
   uint8_t* const write_base = reinterpret_cast<uint8_t*>(raw.data());

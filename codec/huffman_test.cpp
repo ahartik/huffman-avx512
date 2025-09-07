@@ -93,16 +93,33 @@ mollit anim id est laborum.
   string decompressed = TypeParam::Decompress(compressed);
   EXPECT_EQ(raw, decompressed);
 }
+TYPED_TEST(CompressorTest, EqualCounts) {
+  // Produce a string that is not compressible due to containing an equal
+  // amount of all possible bytes. This should result in 8 bits per symbol.
+  //
+  // This tests some edge cases in the code, which caused a bug previously.
+  string raw;
+  for (int i = 0; i < 4; ++i)
+    for (int c = 0; c < 256; ++c)
+      raw.push_back(c);
+  std::shuffle(raw.begin(), raw.end(), std::mt19937());
+
+  string compressed = TypeParam::Compress(raw);
+  string decompressed = TypeParam::Decompress(compressed);
+  EXPECT_EQ(raw, decompressed);
+}
 
 TYPED_TEST(CompressorTest, LongRandom) {
   string raw;
-  int len = 2000;
+  srand(0);
+  int len = 100'000;
   for (int i = 0; i < len; ++i) {
     uint8_t ch = 0;
     do {
       // Make a biased distribution
       ch = (rand() & rand() & rand()) & 0xff;
-    } while (!std::isprint(ch));
+    // } while (!std::isprint(ch));
+    } while (false);
     raw.push_back(ch);
   }
   string compressed = TypeParam::Compress(raw);

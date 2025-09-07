@@ -11,28 +11,28 @@
 
 #include "benchmark/benchmark.h"
 
+constexpr int LEN = 100'000;
+
 namespace {
 template <typename Compressor>
 void BM_CompressBiased(benchmark::State& state) {
   srand(0);
   std::string raw;
-  int len = 3000;
-
-  for (int i = 0; i < len; ++i) {
+  for (int i = 0; i < LEN; ++i) {
     raw.push_back(uint8_t(rand() & rand() & rand()));
   }
 
   for (auto _ : state) {
     std::string compressed = Compressor::Compress(raw);
   }
-  state.SetBytesProcessed(state.iterations() * len);
+  state.SetBytesProcessed(state.iterations() * raw.size());
 }
 
 template <typename Compressor>
 void BM_CompressUniform(benchmark::State& state) {
   srand(0);
   std::string raw;
-  int len = 3000;
+  int len = LEN;
 
   for (int i = 0; i < len; ++i) {
     raw.push_back(uint8_t(rand()));
@@ -41,33 +41,30 @@ void BM_CompressUniform(benchmark::State& state) {
   for (auto _ : state) {
     std::string compressed = Compressor::Compress(raw);
   }
-  state.SetBytesProcessed(state.iterations() * len);
+  state.SetBytesProcessed(state.iterations() * raw.size());
 }
 
 template <typename Compressor>
 void BM_DecompressBiased(benchmark::State& state) {
   srand(0);
   std::string raw;
-  int len = 3000;
 
-  for (int i = 0; i < len; ++i) {
+  for (int i = 0; i < LEN; ++i) {
     raw.push_back(uint8_t(rand() & rand() & rand()));
-    // raw.push_back(uint8_t(rand()));
   }
   std::string compressed = Compressor::Compress(raw);
   for (auto _ : state) {
     std::string decompressed = Compressor::Decompress(compressed);
   }
-  state.SetBytesProcessed(state.iterations() * len);
+  state.SetBytesProcessed(state.iterations() * raw.size());
 }
 
 template <typename Compressor>
 void BM_DecompressUniform(benchmark::State& state) {
   srand(0);
   std::string raw;
-  int len = 3000;
 
-  for (int i = 0; i < len; ++i) {
+  for (int i = 0; i < LEN; ++i) {
     raw.push_back(uint8_t(rand()));
   }
 
@@ -75,7 +72,7 @@ void BM_DecompressUniform(benchmark::State& state) {
   for (auto _ : state) {
     std::string decompressed = Compressor::Decompress(compressed);
   }
-  state.SetBytesProcessed(state.iterations() * len);
+  state.SetBytesProcessed(state.iterations() * raw.size());
 }
 
 template <typename Compressor>
@@ -150,7 +147,8 @@ void BM_DecompressLong(benchmark::State& state) {
   state.counters["ratio"] = ratio;
 }
 
-void BM_CountSymbols(benchmark::State& state) {
+void BM_CountSymbolsBiased(benchmark::State& state) {
+  srand(0);
   const int kLogSize = 16;
   std::string text;
   for (int i = 0; i < kLogSize; ++i) {
@@ -160,6 +158,36 @@ void BM_CountSymbols(benchmark::State& state) {
   }
   std::shuffle(text.begin(), text.end(), std::mt19937());
   text = text.substr(0, 100000 / 32);
+  for (auto _ : state) {
+    int sym_count[256] = {};
+    huffman::internal::CountSymbols(text, sym_count);
+  }
+  state.SetBytesProcessed(state.iterations() * text.size());
+}
+void BM_CountSymbolsUniform(benchmark::State& state) {
+  const int len = 100000 / 32;
+  std::string text;
+  for (int i = 0; i < len; ++i) {
+    text.push_back(rand() % 256);
+  }
+  for (auto _ : state) {
+    int sym_count[256] = {};
+    huffman::internal::CountSymbols(text, sym_count);
+  }
+  state.SetBytesProcessed(state.iterations() * text.size());
+}
+
+void BM_CountSymbolsLongBiased(benchmark::State& state) {
+  const int kLogSize = 16;
+  std::string text;
+  for (int i = 0; i < kLogSize; ++i) {
+    for (int j = 0; j < (1 << i); ++j) {
+      text.push_back('A' + i);
+    }
+  }
+  std::shuffle(text.begin(), text.end(), std::mt19937());
+  text = text.substr(0, 100000);
+
   for (auto _ : state) {
     int sym_count[256] = {};
     huffman::internal::CountSymbols(text, sym_count);
@@ -189,4 +217,6 @@ DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvx<32>)
 DEFINE_BENCHMARKS(::huffman::Huff0Compressor)
 
 
-BENCHMARK(BM_CountSymbols);
+BENCHMARK(BM_CountSymbolsUniform);
+BENCHMARK(BM_CountSymbolsBiased);
+BENCHMARK(BM_CountSymbolsLongBiased);
