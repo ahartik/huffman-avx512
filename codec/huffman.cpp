@@ -23,7 +23,6 @@
 #include <vector>
 
 #include "codec/histogram.h"
-#include "codec/heap.h"
 
 namespace huffman {
 
@@ -319,12 +318,8 @@ void CollectCodeLen(int32_t children[256][2], int node, int len,
 CanonicalCoding MakeCanonicalCoding(const ByteHistogram& sym_count) {
   CanonicalCoding coding;
 
-   SimdHeap heap;
-  // BinaryHeap heap;
-  // TODO: This too could be optimized, perhaps even using AVX.
   for (int c = 0; c < 256; ++c) {
     if (sym_count[c] != 0) {
-      heap.AddInitial(sym_count[c], -1);
       coding.sorted_syms[coding.num_syms] = uint8_t(c);
       ++coding.num_syms;
     }
@@ -333,26 +328,64 @@ CanonicalCoding MakeCanonicalCoding(const ByteHistogram& sym_count) {
     return coding;
   }
 
-  heap.Init();
-
-  int tree_size = 0;
-  int32_t children[256][2];
-  while (heap.size() > 1) {
-    // Pop two elements
-    const auto a = heap.Pop();
-    const auto b = heap.Pop();
-
-    children[tree_size][0] = a.data;
-    children[tree_size][1] = b.data;
-    heap.Push(a.count + b.count, tree_size);
-    ++tree_size;
-  }
-  const auto root = heap.Pop();
-  CollectCodeLen(children, root.data, 0, coding.len_count);
-
   // Sort the symbols in decreasing order of frequency.
   std::sort(coding.sorted_syms, coding.sorted_syms + coding.num_syms,
             [&](uint8_t a, uint8_t b) { return sym_count[a] > sym_count[b]; });
+
+  // Using the approach detailed at
+  // https://en.wikipedia.org/wiki/Huffman_coding#Compression,
+  // we maintain two queues: one for symbols (leaves) and one for internal tree
+  // nodes.
+  //
+  // Our "heap" is implemented using these two queues, reading from
+  // `coding.sorted_sym` and `tree_count`. The syms are sorted in descending
+  // order of frequency, meaning we read from back to front.
+  int next_sym = coding.num_syms - 1;
+  uint32_t tree_count[256] = {};
+  int next_tree_node = 0;
+  int tree_size = 0;
+  auto pop_min_node = [&] () -> std::pair<uint32_t, int> {
+    bool pop_sym = false;
+    if (next_sym >= 0) {
+      int sym = coding.sorted_syms[next_sym];
+      if (next_tree_node == tree_size) {
+        pop_sym = true;
+      } else {
+        pop_sym = sym_count[sym] <= tree_count[next_tree_node];
+      }
+    }
+
+    if (pop_sym) {
+      assert(next_sym >= 0);
+      int sym = coding.sorted_syms[next_sym]; 
+      uint32_t count = sym_count[sym];
+      --next_sym;
+      // Leaves are just -1.
+      return {count, -1};
+    } else {
+      assert(next_tree_node < tree_size);
+      int node = next_tree_node;
+      uint32_t count = tree_count[node];
+      ++next_tree_node;
+      return {count, node};
+    }
+  };
+  auto heap_size = [&] () -> int {
+    return (tree_size - next_tree_node) + (next_sym + 1);
+  };
+
+  int32_t children[256][2];
+  while (heap_size() > 1) {
+    // Pop two elements
+    const auto a = pop_min_node();
+    const auto b = pop_min_node();
+    children[tree_size][0] = a.second;
+    children[tree_size][1] = b.second;
+    tree_count[tree_size] = a.first + b.first;
+    ++tree_size;
+  }
+  const auto root = pop_min_node();
+  CollectCodeLen(children, root.second, 0, coding.len_count);
 
   LimitCodeLengths(coding.len_count);
 
