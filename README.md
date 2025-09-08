@@ -46,4 +46,4 @@ This explains the extremely low
 
 ## Symbol counting performance
 
-## Heaps
+For compression, 

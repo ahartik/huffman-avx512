@@ -69,8 +69,7 @@ TYPED_TEST(CompressorTest, Hello) {
   EXPECT_EQ(raw, decompressed);
 }
 
-TYPED_TEST(CompressorTest, LongerText) {
-  string raw = R"(
+const char* const LOREM = R"(
 Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod
 tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim
 veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea
@@ -79,6 +78,9 @@ velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint
 occaecat cupidatat non proident, sunt in culpa qui officia deserunt
 mollit anim id est laborum.
     )";
+
+TYPED_TEST(CompressorTest, LongerText) {
+  string raw = LOREM;
 
   string compressed = TypeParam::Compress(raw);
   std::cout << std::flush;
@@ -93,6 +95,7 @@ mollit anim id est laborum.
   string decompressed = TypeParam::Decompress(compressed);
   EXPECT_EQ(raw, decompressed);
 }
+
 TYPED_TEST(CompressorTest, EqualCounts) {
   // Produce a string that is not compressible due to containing an equal
   // amount of all possible bytes. This should result in 8 bits per symbol.
@@ -152,13 +155,11 @@ TYPED_TEST(CompressorTest, LongCodes) {
   EXPECT_EQ(text, decompressed);
 }
 
-#if 1
 TYPED_TEST(CompressorTest, EmptyString) {
   string compressed = TypeParam::Compress("");
   string decompressed = TypeParam::Decompress(compressed);
   EXPECT_EQ("", decompressed);
 }
-#endif
 
 TYPED_TEST(CompressorTest, ManyRandom) {
   std::mt19937 mt;

@@ -199,4 +199,5 @@ ByteHistogram MakeHistogram(std::string_view text) {
     return MakeHistogramVectorized(text);
   }
 }
+
 }  // namespace huffman

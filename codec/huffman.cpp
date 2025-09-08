@@ -15,7 +15,6 @@
 #include <bit>
 #include <format>
 #include <iostream>
-#include <limits>
 #include <memory>
 #include <new>
 #include <sstream>
@@ -34,6 +33,8 @@ namespace {
 // Max code length 13 observes some cache misses with AVX-512 decompression,
 // reducing performance slightly and increasing variance. Lower max code length
 // is used to stay comparable to Huff0, which defaults to 11.
+//
+// NOTE: CompressMultiAvx512 relies on this length being <= 12.
 const int kMaxCodeLength = 12;
 // const uint32_t kMaxCodeMask = (1 << kMaxCodeLength) - 1;
 // Maximum code length that would be optimal in terms of compression.  We use
@@ -288,7 +289,6 @@ void LimitCodeLengths(uint16_t* len_count) {
           << "\n";
   DLOG(1) << "kraft_total: " << kraft_total << " one: " << one << "\n";
   DLOG(1) << std::flush;
-  // int second_longest_len = kMaxCodeLength - 1;
   while (kraft_total > one) {
     // Decrease the length of one code with the maximum length.
     --len_count[kMaxCodeLength];
@@ -376,7 +376,7 @@ CanonicalCoding MakeCanonicalCoding(const ByteHistogram& sym_count) {
 
   int32_t children[256][2];
   while (heap_size() > 1) {
-    // Pop two elements
+    // Pop two elements and create a tree node.
     const auto a = pop_min_node();
     const auto b = pop_min_node();
     children[tree_size][0] = a.second;

@@ -14,6 +14,7 @@
 constexpr int LEN = 100'000;
 
 namespace {
+
 template <typename Compressor>
 void BM_CompressBiased(benchmark::State& state) {
   srand(0);
@@ -57,6 +58,8 @@ void BM_DecompressBiased(benchmark::State& state) {
     std::string decompressed = Compressor::Decompress(compressed);
   }
   state.SetBytesProcessed(state.iterations() * raw.size());
+  double ratio = double(compressed.size()) / raw.size();
+  state.counters["ratio"] = ratio;
 }
 
 template <typename Compressor>
@@ -73,6 +76,8 @@ void BM_DecompressUniform(benchmark::State& state) {
     std::string decompressed = Compressor::Decompress(compressed);
   }
   state.SetBytesProcessed(state.iterations() * raw.size());
+  double ratio = double(compressed.size()) / raw.size();
+  state.counters["ratio"] = ratio;
 }
 
 template <typename Compressor>
@@ -106,43 +111,47 @@ void BM_DecompressShort(benchmark::State& state) {
     std::string decompressed = Compressor::Decompress(compressed);
   }
   state.SetBytesProcessed(state.iterations() * len);
+  double ratio = double(compressed.size()) / raw.size();
+  state.counters["ratio"] = ratio;
 }
 
-template <typename Compressor>
-void BM_CompressLong(benchmark::State& state) {
-  srand(0);
-  std::string raw;
-  int len = 100000;
+const char* const LOREM = R"(
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod
+tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim
+veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea
+commodo consequat. Duis aute irure dolor in reprehenderit in voluptate
+velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint
+occaecat cupidatat non proident, sunt in culpa qui officia deserunt
+mollit anim id est laborum.
+    )";
 
-  for (int i = 0; i < len; ++i) {
-    raw.push_back(uint8_t(rand() & rand() & rand()));
+template <typename Compressor>
+void BM_CompressLorem(benchmark::State& state) {
+  std::string raw;
+  while (raw.size() < LEN) {
+    raw.append(LOREM);
   }
+  raw.resize(LEN);
 
   for (auto _ : state) {
     std::string compressed = Compressor::Compress(raw);
   }
-  state.SetBytesProcessed(state.iterations() * len);
+  state.SetBytesProcessed(state.iterations() * raw.size());
 }
 
 template <typename Compressor>
-void BM_DecompressLong(benchmark::State& state) {
-  // std::cout << "BM_DecompressLong\n";
-  std::mt19937 mt;
+void BM_DecompressLorem(benchmark::State& state) {
   std::string raw;
-  int len = 100000;
-
-  for (int i = 0; i < len; ++i) {
-    raw.push_back(uint8_t(mt() & mt() & mt()));
+  while (raw.size() < LEN) {
+    raw.append(LOREM);
   }
+  raw.resize(LEN);
 
   std::string compressed = Compressor::Compress(raw);
-  int64_t total_raw = 0;
   for (auto _ : state) {
     std::string decompressed = Compressor::Decompress(compressed);
-    total_raw += decompressed.size();
   }
-  state.SetBytesProcessed(total_raw);
-
+  state.SetBytesProcessed(state.iterations() * raw.size());
   double ratio = double(compressed.size()) / raw.size();
   state.counters["ratio"] = ratio;
 }
@@ -153,11 +162,11 @@ void BM_DecompressLong(benchmark::State& state) {
   BENCHMARK(BM_CompressBiased<TYPE>);    \
   BENCHMARK(BM_CompressUniform<TYPE>);   \
   BENCHMARK(BM_CompressShort<TYPE>);     \
-  BENCHMARK(BM_CompressLong<TYPE>);      \
+  BENCHMARK(BM_CompressLorem<TYPE>);     \
   BENCHMARK(BM_DecompressBiased<TYPE>);  \
   BENCHMARK(BM_DecompressUniform<TYPE>); \
   BENCHMARK(BM_DecompressShort<TYPE>);   \
-  BENCHMARK(BM_DecompressLong<TYPE>);
+  BENCHMARK(BM_DecompressLorem<TYPE>);   \
 
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressor)
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<4>)

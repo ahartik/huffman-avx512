@@ -4,7 +4,6 @@ cc_library(
   hdrs = ["huffman.h"],
   deps = [
     ":histogram",
-    ":heap",
   ]
 )
 
@@ -51,14 +50,6 @@ cc_binary(
     ":histogram",
     "@google_benchmark//:benchmark_main"
   ],
-)
-
-cc_library(
-  name =  "heap",
-  srcs = [],
-  hdrs = ["heap.h"],
-  deps = [
-  ]
 )
 
 cc_library(
