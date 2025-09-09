@@ -45,7 +45,9 @@ class NameGenerator {
 };
 
 using Compressors = ::testing::Types<
-    huffman::HuffmanCompressor, huffman::HuffmanCompressorMulti<4>,
+    huffman::HuffmanCompressor,
+    huffman::HuffmanCompressorMulti<1>,
+    huffman::HuffmanCompressorMulti<4>,
     huffman::HuffmanCompressorMulti<8>, huffman::HuffmanCompressorMulti<32>,
     // XXX: Fix the decompressor
     huffman::HuffmanCompressorAvx<8>, huffman::HuffmanCompressorAvx<32>,

@@ -347,20 +347,21 @@ CanonicalCoding MakeCanonicalCoding(const ByteHistogram& sym_count) {
   auto pop_min_node = [&] () -> std::pair<uint32_t, int> {
     bool pop_sym = false;
     if (next_sym >= 0) {
-      int sym = coding.sorted_syms[next_sym];
       if (next_tree_node == tree_size) {
         pop_sym = true;
       } else {
+        int sym = coding.sorted_syms[next_sym];
         pop_sym = sym_count[sym] <= tree_count[next_tree_node];
       }
     }
 
     if (pop_sym) {
       assert(next_sym >= 0);
-      int sym = coding.sorted_syms[next_sym]; 
-      uint32_t count = sym_count[sym];
+      uint32_t count = sym_count[coding.sorted_syms[next_sym]];
       --next_sym;
       // Leaves are just -1.
+      // For the final codes we use canonical Huffman codes, the exact shape of
+      // the tree does not matter.
       return {count, -1};
     } else {
       assert(next_tree_node < tree_size);
@@ -374,6 +375,14 @@ CanonicalCoding MakeCanonicalCoding(const ByteHistogram& sym_count) {
     return (tree_size - next_tree_node) + (next_sym + 1);
   };
 
+  // To find the number of codes of each length, we store child links from
+  // created internal nodes, and perform a recursive tree traversal at the end.
+  // created nodes and 
+  // 
+  // This approach is different from Huff0, which collects parent links between
+  // nodes. I found this current code to be just a hair bit faster than the
+  // parent-link approach, and I thought presenting this alternative approach
+  // might be more interesting.
   int32_t children[256][2];
   while (heap_size() > 1) {
     // Pop two elements and create a tree node.
@@ -395,7 +404,7 @@ CanonicalCoding MakeCanonicalCoding(const ByteHistogram& sym_count) {
     }
   }
 
-  // Build "canonical Huffman code".
+  // Build a "canonical Huffman code".
   ForallCodes(coding.len_count, coding.sorted_syms, coding.num_syms,
               [&coding](uint8_t sym, BitCode code) {
                 coding.codes[sym] = code;
@@ -418,6 +427,7 @@ class CodeWriter {
     output_ = end - 8;
     buf_ = 0;
     buf_size_ = 0;
+    assert(output_ >= begin_);
   }
 
   void WriteCode(BitCode code) {
@@ -709,14 +719,13 @@ std::string Compress(std::string_view raw) {
   // #pragma GCC unroll 4
   while (input + 3 < end) {
     // We can write multiple codes for each flush.
-
     UNROLL8 for (int j = 0; j < 4; ++j) {
       BitCode a = coding.codes[*input++];
       writer.WriteFast(a);
     }
     writer.Flush();
   }
-  while (input < end) {
+  while (input != end) {
     writer.WriteCode(coding.codes[*input++]);
   }
   writer.Finish();
@@ -873,32 +882,27 @@ std::string CompressMulti(std::string_view raw) {
         compressed.data() + header_size + ((k == 0) ? 0 : end_offset[k - 1]);
   }
 
-  CodeWriter writer[K];
-  for (int k = 0; k < K; ++k) {
-    writer[k].Init(part_output[k], part_output[k + 1]);
-  }
-
   // It's slightly strange, but ordering these loops like this is faster.
   // Other way around gets better instruction parallelism, but also has more
   // instructions so ends up slower.
   for (int k = 0; k < K; ++k) {
-    while (part_input[k] + 3 < part_end[k]) {
-      writer[k].Flush();
+    CodeWriter writer(part_output[k], part_output[k+1]);
+    const uint8_t* const read_end = part_end[k];
+    const uint8_t* read_ptr = part_input[k];
+    while (read_ptr + 3 < read_end) {
       // We can write three codes of up to 14 bits per each flush.
       static_assert(kMaxCodeLength <= 14);
       UNROLL8 for (int j = 0; j < 4; ++j) {
-        BitCode a = coding.codes[*part_input[k]++];
-        writer[k].WriteFast(a);
+        BitCode a = coding.codes[*read_ptr++];
+        writer.WriteFast(a);
       }
+      writer.Flush();
     }
-  }
-  // Write potential last symbols.
-  for (int k = 0; k < K; ++k) {
-    while (part_input[k] != part_end[k]) {
-      BitCode code = coding.codes[*part_input[k]++];
-      writer[k].WriteCode(code);
+    while (read_ptr != read_end) {
+      BitCode code = coding.codes[*read_ptr++];
+      writer.WriteCode(code);
     }
-    writer[k].Finish();
+    writer.Finish();
   }
 
   return compressed;
@@ -1438,6 +1442,8 @@ std::string DecompressMultiAvx512(std::string_view compressed) {
   return DecompressMultiAvx512Impl<K, Decoder2x>(compressed);
 }
 
+template std::string CompressMulti<1>(std::string_view raw);
+template std::string DecompressMulti<1>(std::string_view compressed);
 template std::string CompressMulti<2>(std::string_view raw);
 template std::string DecompressMulti<2>(std::string_view compressed);
 template std::string CompressMulti<3>(std::string_view raw);

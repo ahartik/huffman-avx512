@@ -169,6 +169,7 @@ void BM_DecompressLorem(benchmark::State& state) {
   BENCHMARK(BM_DecompressLorem<TYPE>);   \
 
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressor)
+DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<1>)
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<4>)
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<8>)
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvx<8>)
