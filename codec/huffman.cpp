@@ -1537,7 +1537,7 @@ std::string DecompressMultiAvx512Registers(std::string_view compressed) {
                   return true;
                 });
     assert(sym_i == header.num_syms);
-    for (int i = last_len+1; i <= 16; ++i) {
+    for (int i = last_len + 1; i <= 16; ++i) {
       first_code_for_len[i] = 0xffff;
     }
   }
@@ -1556,10 +1556,11 @@ std::string DecompressMultiAvx512Registers(std::string_view compressed) {
       // Length is stored at the top 4 bits. This achieves two things:
       // 1. Length can be extracted with one extra instruction
       // 2. data words are ordered by length.
-      
+
       packed_data |= (uint64_t(len << 12) | code_len_offset[len]) << (j * 16);
     }
-    DLOG(1) << std::format("packed_first_code[{}] = {:016x}\n", i, packed_first_code);
+    DLOG(1) << std::format("packed_first_code[{}] = {:016x}\n", i,
+                           packed_first_code);
     DLOG(1) << std::format("packed_data[{}]       = {:016x}\n", i, packed_data);
     first_code_v[i] = _mm512_set1_epi64(packed_first_code);
     decode_data_v[i] = _mm512_set1_epi64(packed_data);
@@ -1616,7 +1617,8 @@ std::string DecompressMultiAvx512Registers(std::string_view compressed) {
     DEF_VECS(write_len, zero_v);
     // 8 symbols can take more than 8 bytes in compressed form sometimes,
     // so we perform two reads of 64 bits, each producing 4 decoded symbols.
-    UNROLL8 for (int half = 0; half < 2; ++half) {
+    // UNROLL8
+    for (int half = 0; half < 2; ++half) {
       DEF_VECS(bits, zero_v);
       FORM(m) {
         // Read the bits to decompress
@@ -1637,66 +1639,91 @@ std::string DecompressMultiAvx512Registers(std::string_view compressed) {
             write_len[m], read_good[m], write_len[m], _mm512_set1_epi64(4));
         bits[m] = _mm512_mask_i64gather_epi64(zero_v, read_good[m], read_v[m],
                                               read_base, 1);
-        // Discard the used bits by shifting them out from the left.
+        // Discard previously used bits by shifting them out from the left.
         // code = (bits << bits_consumed) >> (64 - kMaxCodeLength).
         bits[m] = _mm512_sllv_epi64(bits[m], bits_consumed_v[m]);
       }
-      UNROLL8 for (int byte_i = 0; byte_i < 4; ++byte_i) {
+      //
+      DEF_VECS(code4, zero_v);
+      DEF_VECS(decode_data4, zero_v);
+
+      // UNROLL8
+      for (int byte_i = 0; byte_i < 4; ++byte_i) {
         // Extract the current code.
         DEF_VECS(code, _mm512_srli_epi64(bits[m], 64 - kMaxCodeLength));
         // Repeat it four times in each 64-bit element:
         DEF_VECS(code_repeat, ShuffleWords64(code[m], 0, 0, 0, 0));
+        DEF_VECS(decode_data, zero_v);
 
-        DEF_VECS(decoded_data, zero_v);
-
-        for (int len_i = 0; len_i < 3; ++len_i) {
+        UNROLL8 for (int len_i = 0; len_i < 3; ++len_i) {
           FORM(m) {
             mask32 ge =
                 _mm512_cmpge_epu16_mask(code_repeat[m], first_code_v[len_i]);
-            decoded_data[m] = _mm512_mask_blend_epi16(ge, decoded_data[m],
-                                                      decode_data_v[len_i]);
+            decode_data[m] = _mm512_mask_blend_epi16(ge, decode_data[m],
+                                                     decode_data_v[len_i]);
           }
         }
+
         // Now each 16-bit word contains some potentially-valid decode data.
         // The correct one is the largest one.
         FORM(m) {
-          DLOG(1) << std::format("predata [{}] = {}, byte_i={}\n", m,
-                                 Int64VecToString(decoded_data[m]), byte_i);
-          decoded_data[m] = _mm512_max_epu16(
-              decoded_data[m], _mm512_srli_epi64(decoded_data[m], 16));
-          decoded_data[m] = _mm512_max_epu16(
-              decoded_data[m], _mm512_srli_epi64(decoded_data[m], 32));
+          decode_data[m] = _mm512_max_epu16(
+              decode_data[m], _mm512_rol_epi64(decode_data[m], 16));
+          decode_data[m] = _mm512_max_epu16(
+              decode_data[m], _mm512_rol_epi64(decode_data[m], 32));
 
-          vec8x64 code_len = _mm512_and_epi64(
-              _mm512_srli_epi64(decoded_data[m], 12), _mm512_set1_epi64(15));
-          vec8x64 decode_offset =
-              _mm512_and_epi64(decoded_data[m], _mm512_set1_epi64(0xfff));
-          // Symbol index is found by:
-          // sym_index = (code >> (kMaxCodeLength - code_len)) - decode_offset
-          vec8x64 sym_index = _mm512_sub_epi64(
-              _mm512_srlv_epi64(
-                  code[m], _mm512_sub_epi64(_mm512_set1_epi64(kMaxCodeLength),
-                                            code_len)),
-              decode_offset);
-          sym_i[m] = _mm512_add_epi64(
-              sym_i[m], _mm512_slli_epi64(sym_index, 8 * byte_i + 32 * half));
+          const vec8x64 word_mask =
+              _mm512_set1_epi64(0xffffull << (byte_i * 16));
+          code4[m] = _mm512_or_epi64(
+              code4[m], _mm512_and_epi64(code_repeat[m], word_mask));
+          decode_data4[m] = _mm512_or_epi64(
+              decode_data4[m], _mm512_and_epi64(decode_data[m], word_mask));
 
-          DLOG(1) << std::format("bits[{}] = {}, byte_i={}\n", m,
+          vec8x64 code_len = _mm512_srli_epi64(decode_data[m], 60);
+          bits_consumed_v[m] = _mm512_mask_add_epi64(
+              bits_consumed_v[m], read_good[m], bits_consumed_v[m], code_len);
+          bits[m] = _mm512_sllv_epi64(bits[m], code_len);
+          DLOG(2) << std::format("bits[{}] = {}, byte_i={}\n", m,
                                  Int64VecToString(bits[m]), byte_i)
                   << std::format("code_repeat[{}] = {}, byte_i={}\n", m,
                                  Int64VecToString(code_repeat[m]), byte_i)
                   << std::format("code_len[{}] = {}, byte_i={}\n", m,
-                                 Int64VecToString(code_len), byte_i)
-                  << std::format("decode_offset[{}] = {}, byte_i={}\n", m,
-                                 Int64VecToString(decode_offset), byte_i)
-                  << std::format("sym_index[{}] = {}, byte_i={}\n", m,
-                                 Int64VecToString(sym_index), byte_i);
-
-          bits_consumed_v[m] = _mm512_mask_add_epi64(
-              bits_consumed_v[m], read_good[m],
-              bits_consumed_v[m], code_len);
-          bits[m] = _mm512_sllv_epi64(bits[m], code_len);
+                                 Int64VecToString(code_len), byte_i);
         }
+      }
+      // Now, decode 4 symbols for each stream using the data we gathered:
+      FORM(m) {
+        // These variables contain data in all 16-bit elements.
+        vec8x64 decode_offset =
+            _mm512_and_epi64(decode_data4[m], _mm512_set1_epi16(0xfff));
+        vec8x64 code_len4 = _mm512_srli_epi16(decode_data4[m], 12);
+        // Symbol index is found by:
+        // sym_index = (code >> (kMaxCodeLength - code_len)) - decode_offset
+        vec8x64 sym_index = _mm512_sub_epi16(
+            _mm512_srlv_epi16(
+                code4[m],
+                _mm512_sub_epi16(_mm512_set1_epi16(kMaxCodeLength), code_len4)),
+            decode_offset);
+        // Sym index contains 8-bit indices each stored as a 16-bit word. Next
+        // move them to their proper spot in `sym_i`.
+        vec8x64 sym_shuffle_ctrl =
+            half == 0
+                ? _mm512_set4_epi32(
+                      0xffff'ffff, 0x0e0c'0a08, 0xffff'ffff, 0x0604'0200  //
+                      )
+                : _mm512_set4_epi32(
+                      0x0e0c'0a08, 0xffff'ffff, 0x0604'0200, 0xffff'ffff  //
+                  );
+        sym_i[m] = _mm512_or_si512(
+            sym_i[m], _mm512_shuffle_epi8(sym_index, sym_shuffle_ctrl));
+        DLOG(2) << "COMBINED \n";
+        DLOG(2) << std::format("code4[{}] = {} \n", m,
+                               Int64VecToString(code4[m]))
+                << std::format("decode_data4[{}] = {}\n", m,
+                               Int64VecToString(decode_data4[m]))
+                << std::format("code_len4[{}] = {}\n", m,
+                               Int64VecToString(code_len4));
+        DLOG(2) << "sym_i now: " << Int64VecToString(sym_i[m]) << "\n";
       }
     }
     // Symbol indices have been decoded, now they need to be converted to
