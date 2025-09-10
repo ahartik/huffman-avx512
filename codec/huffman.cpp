@@ -128,19 +128,37 @@ using mask64 = __mmask64;
 
 int CountBits(uint64_t x) { return __builtin_popcountll(x); }
 
+// Shuffle 16-bit words within each 64-bit element. Negative values lead to the
+// corresponding word being zeroed.
+//
+// dst[0:15] = w0 < 0 ? 0 : src[w0*16:w0*16+15]
+// and so on
+vec64x8 ShuffleWords64(vec64x8 src, int w0, int w1, int w2, int w3) {
+  uint64_t hi0 = w0 < 0 ? 0xf0 : (2 * w0 + 1);
+  uint64_t lo0 = w0 < 0 ? 0xf0 : (2 * w0);
+  uint64_t hi1 = w1 < 0 ? 0xf0 : (2 * w1 + 1);
+  uint64_t lo1 = w1 < 0 ? 0xf0 : (2 * w1);
+  uint64_t hi2 = w2 < 0 ? 0xf0 : (2 * w2 + 1);
+  uint64_t lo2 = w2 < 0 ? 0xf0 : (2 * w2);
+  uint64_t hi3 = w3 < 0 ? 0xf0 : (2 * w3 + 1);
+  uint64_t lo3 = w3 < 0 ? 0xf0 : (2 * w3);
+  uint64_t shuffle64 = (hi3 << 56) | (lo3 << 48) | (hi2 << 40) | (lo2 << 32) |
+                       (hi1 << 24) | (lo1 << 16) | (hi0 << 8) | (lo0);
+  //
+  vec8x64 ctrl =
+      _mm512_set4_epi64(shuffle64 + 0x0808'0808'0808'0808, shuffle64,
+                        shuffle64 + 0x0808'0808'0808'0808, shuffle64);
+  return _mm512_shuffle_epi8(src, ctrl);
+}
 vec8x64 GetWord16(vec8x64 vec, int W) {
   switch (W) {
     case 0:
       return _mm512_and_epi64(vec, _mm512_set1_epi64(0xffffULL));
     case 1: {
-      vec64x8 ctrl = _mm512_set4_epi64(0xfffffffFffff0b0a, 0xfffffffFffff0302,
-                                       0xfffffffFffff0b0a, 0xfffffffFffff0302);
-      return _mm512_shuffle_epi8(vec, ctrl);
+      return ShuffleWords64(vec, 1, -1, -1, -1);
     }
     case 2: {
-      vec64x8 ctrl = _mm512_set4_epi64(0xfffffffFffff0d0c, 0xfffffffFffff0504,
-                                       0xfffffffFffff0d0c, 0xfffffffFffff0504);
-      return _mm512_shuffle_epi8(vec, ctrl);
+      return ShuffleWords64(vec, 2, -1, -1, -1);
     }
     case 3: {
       return _mm512_srli_epi64(vec, 48);
@@ -195,6 +213,9 @@ vec8x64 GetWord16ToTopBits(vec8x64 vec, int W) {
 
 struct BitCode {
   BitCode(uint16_t b = 0, uint16_t l = 0) : bits(b), len(l) {}
+  // The prefix code is stored in the kMaxCodeLength least significant bits
+  // such that the "first" bit is stored at the most significant (leftmost)
+  // position. The bits past kMaxCodeLength are zero.
   uint16_t bits;
   // uint16_t mask;
   uint16_t len;
@@ -237,8 +258,8 @@ uint32_t read_u32(std::string_view& in) {
 // code. `func` should have signature bool(uint8_t sym, BitCode code).
 // If `func` returns false, the iteration is stopped.
 template <typename Func>
-void ForallCodes(const uint16_t* len_count, const uint8_t* syms, int num_syms,
-                 Func func) {
+void ForallCodes(const uint16_t len_count[kMaxCodeLength + 1],
+                 const uint8_t* syms, int num_syms, Func func) {
   uint32_t current_code = 0;
   uint64_t current_inc = 1ull << kMaxCodeLength;
   bool aborted = false;
@@ -344,7 +365,7 @@ CanonicalCoding MakeCanonicalCoding(const ByteHistogram& sym_count) {
   uint32_t tree_count[256] = {};
   int next_tree_node = 0;
   int tree_size = 0;
-  auto pop_min_node = [&] () -> std::pair<uint32_t, int> {
+  auto pop_min_node = [&]() -> std::pair<uint32_t, int> {
     bool pop_sym = false;
     if (next_sym >= 0) {
       if (next_tree_node == tree_size) {
@@ -371,14 +392,14 @@ CanonicalCoding MakeCanonicalCoding(const ByteHistogram& sym_count) {
       return {count, node};
     }
   };
-  auto heap_size = [&] () -> int {
+  auto heap_size = [&]() -> int {
     return (tree_size - next_tree_node) + (next_sym + 1);
   };
 
   // To find the number of codes of each length, we store child links from
   // created internal nodes, and perform a recursive tree traversal at the end.
-  // created nodes and 
-  // 
+  // created nodes and
+  //
   // This approach is different from Huff0, which collects parent links between
   // nodes. I found this current code to be just a hair bit faster than the
   // parent-link approach, and I thought presenting this alternative approach
@@ -886,7 +907,7 @@ std::string CompressMulti(std::string_view raw) {
   // Other way around gets better instruction parallelism, but also has more
   // instructions so ends up slower.
   for (int k = 0; k < K; ++k) {
-    CodeWriter writer(part_output[k], part_output[k+1]);
+    CodeWriter writer(part_output[k], part_output[k + 1]);
     const uint8_t* const read_end = part_end[k];
     const uint8_t* read_ptr = part_input[k];
     while (read_ptr + 3 < read_end) {
@@ -1007,8 +1028,7 @@ void DecodeSingleStream(const UsedDecoder& decoder,
   }
 }
 
-// AVX helper macros
-
+// AVX helper macros for multi-stream stuff.
 #define DEF_ARR(type, name, val)                             \
   type name[M];                                              \
   do {                                                       \
@@ -1428,6 +1448,286 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
     _mm512_storeu_epi64(bit_offset + m * 8, bits_consumed_v[m]);
   }
 
+  // Decode 1-2 bytes at a time:
+  for (int k = 0; k < K; ++k) {
+    DecodeSingleStream(decoder, read_base + read_begin_offset[k],
+                       read_base + read_offset[k] + 8, bit_offset[k],
+                       write_base + write_offset[k], write_base + write_end[k]);
+  }
+  return raw;
+}
+
+template <int K>
+std::string DecompressMultiAvx512Registers(std::string_view compressed) {
+  static_assert(K % 8 == 0);
+  constexpr int M = K / 8;
+  const auto header = ParseCompressedHeader(compressed);
+
+  uint64_t read_end_offset[K] = {};
+  for (int k = 0; k < K - 1; ++k) {
+    read_end_offset[k] = read_u32(compressed);
+  }
+  read_end_offset[K - 1] = compressed.size();
+
+  int sizes[K] = {};
+  for (int i = 0; i < K; ++i) {
+    sizes[i] = header.raw_size / K;
+  }
+  for (size_t i = 0; i < header.raw_size % K; ++i) {
+    ++sizes[i];
+  }
+  DLOG(1) << __func__ << ": raw_size = " << header.raw_size << "\n";
+  std::string raw(header.raw_size, 0);
+  const uint8_t* const read_base =
+      reinterpret_cast<const uint8_t*>(compressed.data());
+  uint8_t* const write_base = reinterpret_cast<uint8_t*>(raw.data());
+
+  uint64_t read_begin_offset[K] = {};
+  for (int k = 1; k < K; ++k) {
+    read_begin_offset[k] = read_end_offset[k - 1];
+  }
+  uint64_t read_offset[K] = {};
+  for (int k = 0; k < K; ++k) {
+    read_offset[k] = read_end_offset[k] - 8;
+  }
+
+  uint64_t write_offset[K] = {};
+  for (int k = 1; k < K; ++k) {
+    write_offset[k] = write_offset[k - 1] + sizes[k - 1];
+  }
+
+  uint64_t write_end[K] = {};
+  for (int k = 0; k < K; ++k) {
+    write_end[k] = write_offset[k] + sizes[k];
+  }
+
+  // Decoding method:
+  // 1. For each of the 8 streams (64-bit element), repeat the current
+  //    code (topmost bits) 4 times
+  // 2. Perform comparisons against starting codes for each code length,
+  //    to determine the code length for each stream.
+  // 3. Produce a vector of starting codes corresponding to these code
+  //    lengths, suitably adjusted such that index to sorted symbols can
+  //    be found by subtraction.
+  //  4. Once 8 such indices have been decoded for each stream (total 64
+  //     indices = 64 bytes), look up the symbols ("raw" bytes) using
+  //     `_mm512_permutexvar_epi8`
+
+  // Prepare data for lookups: build vectors for looking up code length by
+  // comparisons.
+  uint16_t first_code_for_len[17] = {};
+  uint16_t code_len_offset[17] = {};
+  int last_len = -1;
+  {
+    int sym_i = 0;
+    ForallCodes(header.len_count, header.syms, header.num_syms,
+                [&](uint8_t sym, BitCode code) {
+                  assert(sym == header.syms[sym_i]);
+                  while (int(code.len) > last_len) {
+                    ++last_len;
+                    first_code_for_len[last_len] = code.bits;
+                    // This offset is used to find the corresponding symbol
+                    // index from a code when the length of the code is known.
+                    uint16_t short_code =
+                        code.bits >> (kMaxCodeLength - code.len);
+                    assert(short_code >= sym_i);
+                    code_len_offset[last_len] = short_code - sym_i;
+                  }
+                  ++sym_i;
+                  return true;
+                });
+    assert(sym_i == header.num_syms);
+    for (int i = last_len+1; i <= 16; ++i) {
+      first_code_for_len[i] = 0xffff;
+    }
+  }
+  DLOG(1) << "last_len = " << last_len << "\n";
+  // We rely on kMaxCodeLength <= 12, which means we only need three
+  static_assert(kMaxCodeLength <= 12);
+  vec8x64 first_code_v[3];
+  vec8x64 decode_data_v[3];
+  for (int i = 0; i < 3; ++i) {
+    uint64_t packed_first_code = 0;
+    uint64_t packed_data = 0;
+    for (int j = 0; j < 4; ++j) {
+      // We don't support zero-length code here.
+      int len = i * 4 + j + 1;
+      packed_first_code |= uint64_t(first_code_for_len[len]) << (j * 16);
+      // Length is stored at the top 4 bits. This achieves two things:
+      // 1. Length can be extracted with one extra instruction
+      // 2. data words are ordered by length.
+      
+      packed_data |= (uint64_t(len << 12) | code_len_offset[len]) << (j * 16);
+    }
+    DLOG(1) << std::format("packed_first_code[{}] = {:016x}\n", i, packed_first_code);
+    DLOG(1) << std::format("packed_data[{}]       = {:016x}\n", i, packed_data);
+    first_code_v[i] = _mm512_set1_epi64(packed_first_code);
+    decode_data_v[i] = _mm512_set1_epi64(packed_data);
+  }
+
+  // Prepare permute vectors for looking up symbols.
+  vec8x64 sym_lookup_v[4];
+  {
+    uint8_t sym_arr[256];
+    uint8_t* sym_end =
+        std::copy(header.syms, header.syms + header.num_syms, sym_arr);
+    std::fill(sym_end, sym_arr + 256, 0xfe);
+    for (int i = 0; i < 4; ++i) {
+      sym_lookup_v[i] = _mm512_loadu_epi8(sym_arr + 64 * i);
+    }
+  }
+
+  // 8 indices for reading data
+  const vec8x64 zero_v = _mm512_setzero_si512();
+  DEF_VECS(read_v, _mm512_loadu_epi64(read_offset + m * 8));
+  DEF_VECS(write_v, _mm512_loadu_epi64(write_offset + m * 8));
+  DEF_VECS(read_begin_v, _mm512_loadu_epi64(read_begin_offset + m * 8));
+  DEF_VECS(write_limit_v,
+           _mm512_sub_epi64(_mm512_loadu_epi64(write_end + m * 8),
+                            _mm512_set1_epi64(7)));
+
+  DEF_ARR(vec8x64, bits_consumed_v, zero_v);
+
+  DEF_ARR(mask8, good, _mm512_cmplt_epi64_mask(write_v[m], write_limit_v[m]));
+
+  auto some_good = [&good]() {
+    mask8 all = good[0];
+    UNROLL8 for (int m = 1; m < M; ++m) { all = _kor_mask8(all, good[m]); }
+    return _cvtmask8_u32(all) != 0;
+  };
+
+  // Each iteration performs 4 decodes for each stream. With Decoder2x, each
+  // decode can result in either 1 or 2 bytes decoded.
+  while (some_good()) {
+    FORM(m) {
+      // Update mask based on which streams still have output space left.
+      good[m] = _kand_mask8(
+          good[m], _mm512_cmplt_epi64_mask(write_v[m], write_limit_v[m]));
+      // Check that we can continue:
+      good[m] = _kand_mask8(
+          good[m], _mm512_cmpge_epi64_mask(read_v[m], read_begin_v[m]));
+    }
+    // For each iteration we decode 8 symbols per stream.
+    //
+    // Conversion from symbol indices (into header.syms) are translated later
+    // into decoded symbols.
+    DEF_VECS(sym_i, zero_v);
+    DEF_ARR(mask8, read_good, good[m]);
+    DEF_VECS(write_len, zero_v);
+    // 8 symbols can take more than 8 bytes in compressed form sometimes,
+    // so we perform two reads of 64 bits, each producing 4 decoded symbols.
+    UNROLL8 for (int half = 0; half < 2; ++half) {
+      DEF_VECS(bits, zero_v);
+      FORM(m) {
+        // Read the bits to decompress
+
+        const vec8x64 bytes_consumed = _mm512_srli_epi64(bits_consumed_v[m], 3);
+        read_v[m] = _mm512_mask_sub_epi64(read_v[m], read_good[m], read_v[m],
+                                          bytes_consumed);
+        // Remainder bits: bits_consumed = bits_consumed % 8;
+        bits_consumed_v[m] =
+            _mm512_mask_and_epi64(bits_consumed_v[m], read_good[m],
+                                  bits_consumed_v[m], _mm512_set1_epi64(7));
+        // Note: because we check for read "goodness" here, it's possible for
+        // one iteration of the overall loop to produce 0,4, or 8 bytes for
+        // each stream.
+        read_good[m] = _kand_mask8(
+            read_good[m], _mm512_cmpge_epi64_mask(read_v[m], read_begin_v[m]));
+        write_len[m] = _mm512_mask_add_epi64(
+            write_len[m], read_good[m], write_len[m], _mm512_set1_epi64(4));
+        bits[m] = _mm512_mask_i64gather_epi64(zero_v, read_good[m], read_v[m],
+                                              read_base, 1);
+        // Discard the used bits by shifting them out from the left.
+        // code = (bits << bits_consumed) >> (64 - kMaxCodeLength).
+        bits[m] = _mm512_sllv_epi64(bits[m], bits_consumed_v[m]);
+      }
+      UNROLL8 for (int byte_i = 0; byte_i < 4; ++byte_i) {
+        // Extract the current code.
+        DEF_VECS(code, _mm512_srli_epi64(bits[m], 64 - kMaxCodeLength));
+        // Repeat it four times in each 64-bit element:
+        DEF_VECS(code_repeat, ShuffleWords64(code[m], 0, 0, 0, 0));
+
+        DEF_VECS(decoded_data, zero_v);
+
+        for (int len_i = 0; len_i < 3; ++len_i) {
+          FORM(m) {
+            mask32 ge =
+                _mm512_cmpge_epu16_mask(code_repeat[m], first_code_v[len_i]);
+            decoded_data[m] = _mm512_mask_blend_epi16(ge, decoded_data[m],
+                                                      decode_data_v[len_i]);
+          }
+        }
+        // Now each 16-bit word contains some potentially-valid decode data.
+        // The correct one is the largest one.
+        FORM(m) {
+          DLOG(1) << std::format("predata [{}] = {}, byte_i={}\n", m,
+                                 Int64VecToString(decoded_data[m]), byte_i);
+          decoded_data[m] = _mm512_max_epu16(
+              decoded_data[m], _mm512_srli_epi64(decoded_data[m], 16));
+          decoded_data[m] = _mm512_max_epu16(
+              decoded_data[m], _mm512_srli_epi64(decoded_data[m], 32));
+
+          vec8x64 code_len = _mm512_and_epi64(
+              _mm512_srli_epi64(decoded_data[m], 12), _mm512_set1_epi64(15));
+          vec8x64 decode_offset =
+              _mm512_and_epi64(decoded_data[m], _mm512_set1_epi64(0xfff));
+          // Symbol index is found by:
+          // sym_index = (code >> (kMaxCodeLength - code_len)) - decode_offset
+          vec8x64 sym_index = _mm512_sub_epi64(
+              _mm512_srlv_epi64(
+                  code[m], _mm512_sub_epi64(_mm512_set1_epi64(kMaxCodeLength),
+                                            code_len)),
+              decode_offset);
+          sym_i[m] = _mm512_add_epi64(
+              sym_i[m], _mm512_slli_epi64(sym_index, 8 * byte_i + 32 * half));
+
+          DLOG(1) << std::format("bits[{}] = {}, byte_i={}\n", m,
+                                 Int64VecToString(bits[m]), byte_i)
+                  << std::format("code_repeat[{}] = {}, byte_i={}\n", m,
+                                 Int64VecToString(code_repeat[m]), byte_i)
+                  << std::format("code_len[{}] = {}, byte_i={}\n", m,
+                                 Int64VecToString(code_len), byte_i)
+                  << std::format("decode_offset[{}] = {}, byte_i={}\n", m,
+                                 Int64VecToString(decode_offset), byte_i)
+                  << std::format("sym_index[{}] = {}, byte_i={}\n", m,
+                                 Int64VecToString(sym_index), byte_i);
+
+          bits_consumed_v[m] = _mm512_mask_add_epi64(
+              bits_consumed_v[m], read_good[m],
+              bits_consumed_v[m], code_len);
+          bits[m] = _mm512_sllv_epi64(bits[m], code_len);
+        }
+      }
+    }
+    // Symbol indices have been decoded, now they need to be converted to
+    // symbols.
+    DEF_VECS(syms, _mm512_permutexvar_epi8(sym_i[m], sym_lookup_v[0]));
+    for (int j = 1; j < 4; ++j) {
+      FORM(m) {
+        mask64 ge =
+            _mm512_cmpge_epu8_mask(sym_i[m], _mm512_set1_epi8(char(64 * j)));
+        syms[m] = _mm512_mask_permutexvar_epi8(syms[m], ge, sym_i[m],
+                                               sym_lookup_v[j]);
+      }
+    }
+
+    FORM(m) {
+      _mm512_mask_i64scatter_epi64(write_base, good[m], write_v[m], syms[m], 1);
+      write_v[m] = _mm512_add_epi64(write_v[m], write_len[m]);
+      good[m] = _kand_mask8(good[m], read_good[m]);
+    }
+  }
+  // Read the rest using scalar code. This means we need to convert the
+  // vectorized state to regular C++ variables.
+  uint64_t bit_offset[K];
+  for (int m = 0; m < M; ++m) {
+    _mm512_storeu_epi64(write_offset + m * 8, write_v[m]);
+    _mm512_storeu_epi64(read_offset + m * 8, read_v[m]);
+    _mm512_storeu_epi64(bit_offset + m * 8, bits_consumed_v[m]);
+  }
+
+  // "regular" decoder is used for the leftover symbols.
+  Decoder1x decoder(header.len_count, header.syms, header.num_syms);
   // Decode 1 byte at a time:
   for (int k = 0; k < K; ++k) {
     DecodeSingleStream(decoder, read_base + read_begin_offset[k],
@@ -1439,7 +1739,8 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
 
 template <int K>
 std::string DecompressMultiAvx512(std::string_view compressed) {
-  return DecompressMultiAvx512Impl<K, Decoder2x>(compressed);
+  // return DecompressMultiAvx512Impl<K, Decoder2x>(compressed);
+  return DecompressMultiAvx512Registers<K>(compressed);
 }
 
 template std::string CompressMulti<1>(std::string_view raw);

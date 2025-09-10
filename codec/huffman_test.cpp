@@ -49,7 +49,6 @@ using Compressors = ::testing::Types<
     huffman::HuffmanCompressorMulti<1>,
     huffman::HuffmanCompressorMulti<4>,
     huffman::HuffmanCompressorMulti<8>, huffman::HuffmanCompressorMulti<32>,
-    // XXX: Fix the decompressor
     huffman::HuffmanCompressorAvx<8>, huffman::HuffmanCompressorAvx<32>,
     AvxCheckCompressor<8>, huffman::Huff0Compressor>;
 TYPED_TEST_SUITE(CompressorTest, Compressors, NameGenerator);
