@@ -1552,12 +1552,22 @@ std::string DecompressMultiAvx512Registers(std::string_view compressed) {
     for (int j = 0; j < 4; ++j) {
       // We don't support zero-length code here.
       int len = i * 4 + j + 1;
-      packed_first_code |= uint64_t(first_code_for_len[len]) << (j * 16);
-      // Length is stored at the top 4 bits. This achieves two things:
-      // 1. Length can be extracted with one extra instruction
-      // 2. data words are ordered by length.
-
-      packed_data |= (uint64_t(len << 12) | code_len_offset[len]) << (j * 16);
+      if (len <= last_len) {
+        // Here the code is shifted so that the first bit is the most
+        // significant bit of a 16-bit word.
+        packed_first_code |= uint64_t(first_code_for_len[len])
+                             << (j * 16 + 16 - kMaxCodeLength);
+        // Length is stored at the top 4 bits of the "decode data". This
+        // allows the length to be extracted after lookup. Also, the codes will
+        // be ordered by length.
+        packed_data |= (uint64_t(len << 12) | code_len_offset[len]) << (j * 16);
+      } else {
+        packed_first_code |= 0xffffULL << (j * 16);
+        // If we encounter FFFF in the stream we still need to decode that as
+        // `last_len`.
+        packed_data |= (uint64_t(last_len << 12) | code_len_offset[last_len])
+                       << (j * 16);
+      }
     }
     DLOG(1) << std::format("packed_first_code[{}] = {:016x}\n", i,
                            packed_first_code);
@@ -1613,10 +1623,16 @@ std::string DecompressMultiAvx512Registers(std::string_view compressed) {
     // Conversion from symbol indices (into header.syms) are translated later
     // into decoded symbols.
     DEF_VECS(sym_i, zero_v);
+    // Read "goodness" is tracked separately inside each iteration, since we
+    // may run out of data to read after producing 4 bytes. In that case we
+    // still want to do the write, but reading will stop after the first half,
+    // and overall `good` mask will be updated for the next iteration.
     DEF_ARR(mask8, read_good, good[m]);
     DEF_VECS(write_len, zero_v);
     // 8 symbols can take more than 8 bytes in compressed form sometimes,
     // so we perform two reads of 64 bits, each producing 4 decoded symbols.
+    
+    // Unrolling is a small optimization here:
     // UNROLL8
     for (int half = 0; half < 2; ++half) {
       DEF_VECS(bits, zero_v);
@@ -1647,12 +1663,12 @@ std::string DecompressMultiAvx512Registers(std::string_view compressed) {
       DEF_VECS(code4, zero_v);
       DEF_VECS(decode_data4, zero_v);
 
+      // Unrolling this loop actually makes the code slower
       // UNROLL8
       for (int byte_i = 0; byte_i < 4; ++byte_i) {
-        // Extract the current code.
-        DEF_VECS(code, _mm512_srli_epi64(bits[m], 64 - kMaxCodeLength));
-        // Repeat it four times in each 64-bit element:
-        DEF_VECS(code_repeat, ShuffleWords64(code[m], 0, 0, 0, 0));
+        // Repeat the next code (most significant bits) four times in each
+        // 64-bit element:
+        DEF_VECS(code_repeat, ShuffleWords64(bits[m], 3, 3, 3, 3));
         DEF_VECS(decode_data, zero_v);
 
         UNROLL8 for (int len_i = 0; len_i < 3; ++len_i) {
@@ -1671,7 +1687,9 @@ std::string DecompressMultiAvx512Registers(std::string_view compressed) {
               decode_data[m], _mm512_rol_epi64(decode_data[m], 16));
           decode_data[m] = _mm512_max_epu16(
               decode_data[m], _mm512_rol_epi64(decode_data[m], 32));
-
+          // Since we used rotates, the correct decode data is now found in
+          // each 16-bit word. We store the code and the found data in the
+          // corresponding spots in `code4` and `decode_data4`.
           const vec8x64 word_mask =
               _mm512_set1_epi64(0xffffull << (byte_i * 16));
           code4[m] = _mm512_or_epi64(
@@ -1701,8 +1719,7 @@ std::string DecompressMultiAvx512Registers(std::string_view compressed) {
         // sym_index = (code >> (kMaxCodeLength - code_len)) - decode_offset
         vec8x64 sym_index = _mm512_sub_epi16(
             _mm512_srlv_epi16(
-                code4[m],
-                _mm512_sub_epi16(_mm512_set1_epi16(kMaxCodeLength), code_len4)),
+                code4[m], _mm512_sub_epi16(_mm512_set1_epi16(16), code_len4)),
             decode_offset);
         // Sym index contains 8-bit indices each stored as a 16-bit word. Next
         // move them to their proper spot in `sym_i`.
@@ -1727,7 +1744,7 @@ std::string DecompressMultiAvx512Registers(std::string_view compressed) {
       }
     }
     // Symbol indices have been decoded, now they need to be converted to
-    // symbols.
+    // symbols. This is done by repeated masked vpermb instructions.
     DEF_VECS(syms, _mm512_permutexvar_epi8(sym_i[m], sym_lookup_v[0]));
     for (int j = 1; j < 4; ++j) {
       FORM(m) {
