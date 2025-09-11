@@ -1631,10 +1631,9 @@ std::string DecompressMultiAvx512Registers(std::string_view compressed) {
     DEF_VECS(write_len, zero_v);
     // 8 symbols can take more than 8 bytes in compressed form sometimes,
     // so we perform two reads of 64 bits, each producing 4 decoded symbols.
-    
+
     // Unrolling is a small optimization here:
-    // UNROLL8
-    for (int half = 0; half < 2; ++half) {
+    UNROLL8 for (int half = 0; half < 2; ++half) {
       DEF_VECS(bits, zero_v);
       FORM(m) {
         // Read the bits to decompress
@@ -1643,6 +1642,7 @@ std::string DecompressMultiAvx512Registers(std::string_view compressed) {
         read_v[m] = _mm512_mask_sub_epi64(read_v[m], read_good[m], read_v[m],
                                           bytes_consumed);
         // Remainder bits: bits_consumed = bits_consumed % 8;
+        // pauli was here
         bits_consumed_v[m] =
             _mm512_mask_and_epi64(bits_consumed_v[m], read_good[m],
                                   bits_consumed_v[m], _mm512_set1_epi64(7));
@@ -1712,27 +1712,33 @@ std::string DecompressMultiAvx512Registers(std::string_view compressed) {
       // Now, decode 4 symbols for each stream using the data we gathered:
       FORM(m) {
         // These variables contain data in all 16-bit elements.
-        vec8x64 decode_offset =
+        const vec8x64 decode_offset =
             _mm512_and_epi64(decode_data4[m], _mm512_set1_epi16(0xfff));
-        vec8x64 code_len4 = _mm512_srli_epi16(decode_data4[m], 12);
+        const vec8x64 code_len4 = _mm512_srli_epi16(decode_data4[m], 12);
         // Symbol index is found by:
-        // sym_index = (code >> (kMaxCodeLength - code_len)) - decode_offset
-        vec8x64 sym_index = _mm512_sub_epi16(
+        // sym_index = (code >> (16 - code_len)) - decode_offset
+        const vec8x64 sym_index = _mm512_sub_epi16(
             _mm512_srlv_epi16(
                 code4[m], _mm512_sub_epi16(_mm512_set1_epi16(16), code_len4)),
             decode_offset);
-        // Sym index contains 8-bit indices each stored as a 16-bit word. Next
-        // move them to their proper spot in `sym_i`.
-        vec8x64 sym_shuffle_ctrl =
-            half == 0
-                ? _mm512_set4_epi32(
-                      0xffff'ffff, 0x0e0c'0a08, 0xffff'ffff, 0x0604'0200  //
-                      )
-                : _mm512_set4_epi32(
-                      0x0e0c'0a08, 0xffff'ffff, 0x0604'0200, 0xffff'ffff  //
-                  );
-        sym_i[m] = _mm512_or_si512(
-            sym_i[m], _mm512_shuffle_epi8(sym_index, sym_shuffle_ctrl));
+        // Now `sym_index` holds the indices for these four symbols as 16-bit
+        // integer values. Convert these to 8-bit values and order them so that
+        // the first four bytes correspond to the the first four bytes of
+        // `sym_i` and so on.
+        if (half == 0) {
+          // Do the processing after the second half.
+          sym_i[m] = sym_index;
+        } else {
+          assert(half == 1);
+          //
+          sym_i[m] = _mm512_or_si512(sym_i[m], _mm512_slli_epi64(sym_index, 8));
+          // Sym index contains 8-bit indices each stored as a 16-bit word. Next
+          // move them to their proper spot in `sym_i`.
+          const vec8x64 sym_shuffle_ctrl = _mm512_set4_epi32(
+              0x0f0d'0b09, 0x0e0c'0a08, 0x0705'0301, 0x0604'0200  //
+          );
+          sym_i[m] = _mm512_shuffle_epi8(sym_i[m], sym_shuffle_ctrl);
+        }
         DLOG(2) << "COMBINED \n";
         DLOG(2) << std::format("code4[{}] = {} \n", m,
                                Int64VecToString(code4[m]))
