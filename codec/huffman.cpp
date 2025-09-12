@@ -1034,6 +1034,18 @@ void DecodeSingleStream(const UsedDecoder& decoder,
   }
 }
 
+template <int Scale>
+vec8x64 SimulateGather(vec8x64 index, const void* base) {
+    alignas(64) uint64_t ind_buf[8];  
+    alignas(64) char gather_buf[64];  
+    _mm512_store_epi64(ind_buf, index);
+    UNROLL8 for (int k = 0; k < 8; ++k) {
+      memcpy(gather_buf + 8 * k, reinterpret_cast<const char*>(base) + 
+          ind_buf[k] * Scale, 8);
+      }
+    return _mm512_load_epi64(gather_buf);
+}
+
 // An AVX-512 ZMM* register holds 512 bits, which here is split into 8 64-bit
 // integers. this means 8 streams are processed simultaneously. To achieve
 // higher IPC, we also support multiples of 8 streams (16, 24, 32, ...).
@@ -1133,7 +1145,7 @@ std::string CompressMultiAvx512Permute(std::string_view raw) {
 
   assert(compressed.size() == header_size);
   compressed.resize(compressed_size);
-  const void* const read_base = raw.data();
+  const char* const read_base = raw.data();
   char* const write_base = compressed.data() + header_size;
   uint64_t write_index[K];
   for (int k = 0; k < K; ++k) {
@@ -1168,6 +1180,7 @@ std::string CompressMultiAvx512Permute(std::string_view raw) {
   const int M = K / 8;
   DEF_VECS(buf_v, _mm512_setzero_si512());
   DEF_VECS(buf_len_v, _mm512_setzero_si512());
+
   DEF_VECS(read_v, _mm512_loadu_epi64(read_index + 8 * m));
   DEF_VECS(write_v, _mm512_loadu_epi64(write_index + 8 * m));
 
@@ -1176,7 +1189,22 @@ std::string CompressMultiAvx512Permute(std::string_view raw) {
   for (size_t read_i = 0; read_i + 7 < sizes[K - 1]; read_i += 8) {
     const vec64x8 lohi_ctrl =
         _mm512_set4_epi32(0x0f0e'0d0c,0x0706'0504, 0x0b0a'0908,0x0302'0100);
+#if 0
+    // TODO: Optimize and compare "fake" gather.
+    vec64x8 bytes[M];
+    alignas(64) char gather_buf[64];  
+    FORM(m) {
+      UNROLL8 for (int k = 0; k < 8; ++k) {
+        memcpy(gather_buf + 8 * k, read_base + read_index[m * 8 + k], 8);
+      }
+      UNROLL8 for (int k = 0; k < 8; ++k) {
+        read_index[m * 8 + k] += 8;
+      }
+      bytes[m] = _mm512_load_epi64(gather_buf);
+    }
+#endif
     DEF_VECS(bytes, _mm512_i64gather_epi64(read_v[m], read_base, 1));
+    // DEF_VECS(bytes, SimulateGather<1>(read_v[m], read_base));
     FORM(m) {
       read_v[m] = _mm512_add_epi64(read_v[m], _mm512_set1_epi64(8));
       // Low and high bytes of the codes are combined using
