@@ -19,6 +19,16 @@ std::string CompressMultiAvx512(std::string_view raw);
 template <int K>
 std::string DecompressMultiAvx512(std::string_view compressed);
 
+// Specific implementations, 
+template <int K>
+std::string CompressMultiAvx512Gather(std::string_view raw);
+template <int K>
+std::string CompressMultiAvx512Permute(std::string_view raw);
+template <int K>
+std::string DecompressMultiAvx512Gather(std::string_view compressed);
+template <int K>
+std::string DecompressMultiAvx512Permute(std::string_view compressed);
+
 class HuffmanCompressor {
  public:
   static std::string Compress(std::string_view raw) {
@@ -62,11 +72,5 @@ class HuffmanCompressorAvx {
     return std::format("HuffmanAvx<{}>", K);
   }
 };
-
-namespace internal {
-
-void CountSymbols(std::string_view text, int* sym_count);
-
-} // namespace internal;
 
 }  // namespace huffman

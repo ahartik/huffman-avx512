@@ -1,13 +1,11 @@
 #include "codec/huffman.h"
 #include "codec/huff0.h"
 
-#include <iostream>
 
 #include <cstdint>
 #include <cstdlib>
 
 #include <string>
-#include <random>
 
 #include "benchmark/benchmark.h"
 
@@ -174,6 +172,9 @@ DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<4>)
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<8>)
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvx<8>)
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvx<16>)
+DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvx<24>)
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvx<32>)
+DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvx<40>)
+DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvx<48>)
 
 DEFINE_BENCHMARKS(::huffman::Huff0Compressor)

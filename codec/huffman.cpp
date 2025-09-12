@@ -819,6 +819,12 @@ std::string Decompress(std::string_view compressed) {
   return DecompressImpl<Decoder2x>(compressed);
 }
 
+template <int T>
+class CompressBase {
+ public:
+ private:
+};
+
 template <int K>
 std::string CompressMulti(std::string_view raw) {
   const auto sizes = SliceSizes<K>(raw.size());
@@ -1028,19 +1034,30 @@ void DecodeSingleStream(const UsedDecoder& decoder,
   }
 }
 
-// AVX helper macros for multi-stream stuff.
+// An AVX-512 ZMM* register holds 512 bits, which here is split into 8 64-bit
+// integers. this means 8 streams are processed simultaneously. To achieve
+// higher IPC, we also support multiples of 8 streams (16, 24, 32, ...).
+//
+// Symbols used in AVX-512 compression and decompression functions:
+// - K = Number of streams
+// - M = K / 8, number of 512-bit registers.
+//
+// The following macros are used to create and use arrays of SIMD variables.
+
+// Defines an array of variables, one for every
 #define DEF_ARR(type, name, val)                             \
   type name[M];                                              \
   do {                                                       \
     UNROLL8 for (int m = 0; m < M; ++m) { name[m] = (val); } \
   } while (0)
 
+// The typical use case: define an array of 512-bit vectors.
 #define DEF_VECS(name, val) DEF_ARR(vec8x64, name, val);
 
 #define FORM(m) UNROLL8 for (int m = 0; m < M; ++m)
 
 template <int K>
-std::string CompressMultiAvx512(std::string_view raw) {
+std::string CompressMultiAvx512Permute(std::string_view raw) {
   // This restriction could be lifted by using masks.
   static_assert(K % 8 == 0);
 
@@ -1158,8 +1175,7 @@ std::string CompressMultiAvx512(std::string_view raw) {
   // condition on that.
   for (size_t read_i = 0; read_i + 7 < sizes[K - 1]; read_i += 8) {
     const vec64x8 lohi_ctrl =
-        _mm512_set4_epi64(0x0f0e'0d0c'0706'0504, 0x0b0a'0908'0302'0100,
-                          0x0f0e'0d0c'0706'0504, 0x0b0a'0908'0302'0100);
+        _mm512_set4_epi32(0x0f0e'0d0c,0x0706'0504, 0x0b0a'0908,0x0302'0100);
     DEF_VECS(bytes, _mm512_i64gather_epi64(read_v[m], read_base, 1));
     FORM(m) {
       read_v[m] = _mm512_add_epi64(read_v[m], _mm512_set1_epi64(8));
@@ -1173,7 +1189,10 @@ std::string CompressMultiAvx512(std::string_view raw) {
       bytes[m] = _mm512_shuffle_epi8(bytes[m], lohi_ctrl);
     }
 
-    // Decode all 64 bytes simultaneously.
+    // Look up codes for all 64 bytes simultaneously.
+    // Each vpermb/_mm512_permutexvar_epi8 does a lookup of 64 elements.
+    // The operation repeated 4 times and masked using comparisons to cover all
+    // 256 possible byte values.
     DEF_VECS(code_hi, _mm512_permutexvar_epi8(bytes[m], hi_v[0]));
     DEF_VECS(code_lo, _mm512_permutexvar_epi8(bytes[m], lo_v[0]));
     FORM(m) {
@@ -1189,22 +1208,22 @@ std::string CompressMultiAvx512(std::string_view raw) {
 
     // Now, we must rearrange and pack these codes. We'll do this by
     // processing 4 symbols for each stream at a time.
-    UNROLL8 for (int j = 0; j < 2; ++j) {
+    // UNROLL8 doesn't help here.
+    for (int j = 0; j < 2; ++j) {
+      DEF_VECS(pack4,  j == 0 ? _mm512_unpacklo_epi8(code_lo[m], code_hi[m])
+                                : _mm512_unpackhi_epi8(code_lo[m], code_hi[m]));
+      // Length was stored in low bits of `code_lo`
+      DEF_VECS(len4,  _mm512_and_si512(pack4[m], _mm512_set1_epi16(0xf)));
+      // (Using "andnot" instead of "and" saves one register.)
+      DEF_VECS(code4, _mm512_andnot_si512(_mm512_set1_epi16(0xf), pack4[m]));
       FORM(m) {
-        vec64x8 pack16 = j == 0 ? _mm512_unpacklo_epi8(code_lo[m], code_hi[m])
-                                : _mm512_unpackhi_epi8(code_lo[m], code_hi[m]);
-        // Length was stored in low bits of `code_lo`
-        vec64x8 len16 = _mm512_and_si512(pack16, _mm512_set1_epi16(0xf));
-        // (Using "andnot" instead of "and" saves one register.)
-        pack16 = _mm512_andnot_si512(_mm512_set1_epi16(0xf), pack16);
         // Now four codes are stored in the 16-bit words of each 64-bit integer
         // in `pack16`, with one 64-bit integer for each stream. `len16` stores
         // the length of each code in a 16-bit word at the same position.  Next
         // we must pack the codes by shifting.
-
         UNROLL8 for (int z = 0; z < 4; ++z) {
-          const vec64x8 len = GetWord16(len16, z);
-          const vec64x8 code_left = GetWord16ToTopBits(pack16, z);
+          const vec64x8 len = GetWord16(len4[m], z);
+          const vec64x8 code_left = GetWord16ToTopBits(code4[m], z);
           buf_v[m] = _mm512_or_epi64(
               buf_v[m], _mm512_srlv_epi64(code_left, buf_len_v[m]));
           buf_len_v[m] = _mm512_add_epi64(buf_len_v[m], len);
@@ -1250,6 +1269,189 @@ std::string CompressMultiAvx512(std::string_view raw) {
   }
 
   return compressed;
+}
+
+template <int K>
+std::string CompressMultiAvx512Gather(std::string_view raw) {
+  // This restriction could be lifted by using masks.
+  static_assert(K % 8 == 0);
+
+  const auto sizes = SliceSizes<K>(raw.size());
+  uint64_t read_index[K];
+  read_index[0] = 0;
+  for (int k = 1; k < K; ++k) {
+    read_index[k] = read_index[k - 1] + sizes[k - 1];
+  }
+  uint64_t read_end[K];
+  for (int k = 0; k < K; ++k) {
+    read_end[k] = read_index[k] + sizes[k];
+  }
+  // Count symbols in each component.
+  // (I think this performs "value-initialization" on std::array elements,
+  // which means the counts are set to zero.)
+  std::vector<ByteHistogram> part_hist(K);
+  ByteHistogram total_hist = {};
+  {
+    for (int k = 0; k < K; ++k) {
+      part_hist[k] = MakeHistogram(raw.substr(read_index[k], sizes[k]));
+    }
+    for (int k = 0; k < K; ++k) {
+      for (int i = 0; i < 256; ++i) {
+        total_hist[i] += part_hist[k][i];
+      }
+    }
+  }
+  CanonicalCoding coding = MakeCanonicalCoding(total_hist);
+
+  const int kSlop = 8;
+  // Compute starting positions for each part in the output.
+  uint64_t write_end[K] = {};
+  {
+    int pos = 0;
+    for (int part = 0; part < K; ++part) {
+      int64_t num_bits = 0;
+      for (int c = 0; c < 256; ++c) {
+        num_bits += part_hist[part][c] * coding.codes[c].len;
+      }
+      pos += sizes[part];
+      write_end[part] = (num_bits + 7) / 8 + kSlop;
+    }
+  }
+  for (int i = 1; i < K; ++i) {
+    write_end[i] += write_end[i - 1];
+  }
+  DLOG(1) << "End offsets: ";
+  for (int i = 0; i < K; ++i) {
+    DLOG(1) << write_end[i] << " ";
+  }
+  DLOG(1) << "\n";
+
+  // TODO: Use varints
+  const size_t header_size =
+      4 + 4 + CountBits(coding.len_mask) + coding.num_syms + (K - 1) * (4);
+  const size_t compressed_size = header_size + write_end[K - 1];
+  std::string compressed;
+  compressed.reserve(compressed_size);
+  write_u32(compressed, raw.size());
+  write_u32(compressed, coding.len_mask);
+  for (int len = 0; len < 32; ++len) {
+    int count = coding.len_count[len];
+    if (count != 0) {
+      compressed.push_back(count);
+    }
+  }
+  compressed.append(reinterpret_cast<char*>(coding.sorted_syms),
+                    coding.num_syms);
+  for (int k = 0; k < K - 1; ++k) {
+    write_u32(compressed, write_end[k]);
+  }
+
+  assert(compressed.size() == header_size);
+  compressed.resize(compressed_size);
+  const void* const read_base = raw.data();
+  char* const write_base = compressed.data() + header_size;
+  uint64_t write_index[K];
+  for (int k = 0; k < K; ++k) {
+    write_index[k] = write_end[k] - 8;
+  }
+
+  // Slightly modified version of BitCode.
+  struct BitCodeForGather {
+    uint16_t len;
+    // Unlike BitCode::bits, this has the first bit be the 15th bit, i.e. the
+    // most significant bit of a 16-bit word.
+    uint16_t bits;
+  };
+  BitCodeForGather codes[256 + 1];
+  for (int i = 0; i < 256; ++i) {
+    codes[i].len = coding.codes[i].len;
+    codes[i].bits = coding.codes[i].bits << (16 - kMaxCodeLength);
+  }
+
+  // These variables are for storing the leftover state.
+  uint64_t buf_arr[K];
+  uint64_t buf_len_arr[K];
+  const int M = K / 8;
+  DEF_VECS(buf_v, _mm512_setzero_si512());
+  DEF_VECS(buf_len_v, _mm512_setzero_si512());
+  DEF_VECS(read_v, _mm512_loadu_epi64(read_index + 8 * m));
+  DEF_VECS(write_v, _mm512_loadu_epi64(write_index + 8 * m));
+
+  // Last stripe is always one of the smallest, so we can just base our loop
+  // condition on that.
+  for (size_t read_i = 0; read_i + 7 < sizes[K - 1]; read_i += 8) {
+    DEF_VECS(bytes, _mm512_i64gather_epi64(read_v[m], read_base, 1));
+    FORM(m) { read_v[m] = _mm512_add_epi64(read_v[m], _mm512_set1_epi64(8)); }
+
+    UNROLL8 for (int half = 0; half < 2; ++half) {
+      UNROLL8 for (int z = 0; z < 4; ++z) {
+        FORM(m) {
+          // XXX: This can be optimized slightly:
+          const vec64x8 current_byte =
+              _mm512_and_epi64(_mm512_srli_epi64(bytes[m], half * 32 + z * 8),
+                               _mm512_set1_epi64(0xff));
+          const vec64x8 bitcode = _mm512_i64gather_epi64(
+              current_byte, codes, sizeof(BitCodeForGather));
+          const vec64x8 code_len =
+              _mm512_and_epi64(bitcode, _mm512_set1_epi64(0xff));
+          const vec64x8 code_left = GetWord16ToTopBits(bitcode, 1);
+
+          buf_v[m] = _mm512_or_epi64(
+              buf_v[m], _mm512_srlv_epi64(code_left, buf_len_v[m]));
+          buf_len_v[m] = _mm512_add_epi64(buf_len_v[m], code_len);
+        }
+      }
+      FORM(m) {
+        // Flush buffer
+        vec8x64 num_bytes = _mm512_srli_epi64(buf_len_v[m], 3);
+        _mm512_i64scatter_epi64(write_base, write_v[m], buf_v[m], 1);
+        write_v[m] = _mm512_sub_epi64(write_v[m], num_bytes);
+        // Shift these bytes out to the left from `buf_v`.
+        vec8x64 written_bits =
+            _mm512_andnot_epi64(_mm512_set1_epi64(7), buf_len_v[m]);
+        buf_v[m] = _mm512_sllv_epi64(buf_v[m], written_bits);
+        buf_len_v[m] = _mm512_and_epi64(buf_len_v[m], _mm512_set1_epi64(7));
+      }
+    }
+  }
+  FORM(m) {
+    // Store vector registers back to C arrays.
+    _mm512_storeu_epi64(buf_arr + 8 * m, buf_v[m]);
+    _mm512_storeu_epi64(buf_len_arr + 8 * m, buf_len_v[m]);
+    _mm512_storeu_epi64(read_index + 8 * m, read_v[m]);
+    _mm512_storeu_epi64(write_index + 8 * m, write_v[m]);
+  }
+
+  // Write remaining bytes one stream at a time.
+  for (int k = 0; k < K; ++k) {
+    uint64_t buf = buf_arr[k];
+    uint64_t buf_len = buf_len_arr[k];
+    char* write_ptr = write_base + write_index[k];
+    assert(write_index[k] < (1 << 30));
+    for (uint64_t i = read_index[k]; i < read_end[k]; ++i) {
+      const uint8_t s = raw[i];
+      auto code = coding.codes[s];
+      buf |= uint64_t(code.bits) << (64 - buf_len - kMaxCodeLength);
+      buf_len += code.len;
+      // Flush:
+      memcpy(write_ptr, &buf, 8);
+      uint32_t num_bytes = buf_len >> 3;
+      write_ptr -= num_bytes;
+      buf <<= 8 * num_bytes;
+      buf_len &= 7;
+    }
+  }
+
+  return compressed;
+}
+
+template <int K>
+std::string CompressMultiAvx512(std::string_view raw) {
+#ifdef HUFF_COMPRESS_GATHER
+  return CompressMultiAvx512Gather<K>(raw);
+#else
+  return CompressMultiAvx512Permute<K>(raw);
+#endif
 }
 
 template <int K, typename UsedDecoder>
@@ -1458,7 +1660,12 @@ std::string DecompressMultiAvx512Impl(std::string_view compressed) {
 }
 
 template <int K>
-std::string DecompressMultiAvx512Registers(std::string_view compressed) {
+std::string DecompressMultiAvx512Gather(std::string_view compressed) {
+  return DecompressMultiAvx512Impl<K, Decoder2x>(compressed);
+}
+
+template <int K>
+std::string DecompressMultiAvx512Permute(std::string_view compressed) {
   static_assert(K % 8 == 0);
   constexpr int M = K / 8;
   const auto header = ParseCompressedHeader(compressed);
@@ -1789,32 +1996,40 @@ std::string DecompressMultiAvx512Registers(std::string_view compressed) {
 
 template <int K>
 std::string DecompressMultiAvx512(std::string_view compressed) {
-  // return DecompressMultiAvx512Impl<K, Decoder2x>(compressed);
-  return DecompressMultiAvx512Registers<K>(compressed);
+#ifdef HUFF_DECOMPRESS_PERMUTE
+  return DecompressMultiAvx512Permute<K>(compressed);
+#else
+  return DecompressMultiAvx512Gather<K>(compressed);
+#endif
 }
 
-template std::string CompressMulti<1>(std::string_view raw);
-template std::string DecompressMulti<1>(std::string_view compressed);
-template std::string CompressMulti<2>(std::string_view raw);
-template std::string DecompressMulti<2>(std::string_view compressed);
-template std::string CompressMulti<3>(std::string_view raw);
-template std::string DecompressMulti<3>(std::string_view compressed);
-template std::string CompressMulti<4>(std::string_view raw);
-template std::string DecompressMulti<4>(std::string_view compressed);
+#define INSTANTIATE_SCALAR(K)                                  \
+  template std::string CompressMulti<K>(std::string_view raw); \
+  template std::string DecompressMulti<K>(std::string_view compressed)
 
-template std::string CompressMulti<8>(std::string_view raw);
-template std::string DecompressMulti<8>(std::string_view compressed);
+#define INSTANTIATE_AVX(K)                                                    \
+  template std::string CompressMultiAvx512<K>(std::string_view raw);          \
+  template std::string DecompressMultiAvx512<K>(std::string_view compressed); \
+  template std::string CompressMultiAvx512Permute<K>(                       \
+      std::string_view compressed);                                           \
+  template std::string DecompressMultiAvx512Permute<K>(                     \
+      std::string_view compressed);                                           \
+  template std::string DecompressMultiAvx512Gather<K>(                        \
+      std::string_view compressed);                                           \
+  template std::string CompressMultiAvx512Gather<K>(std::string_view compressed)
 
-template std::string CompressMulti<32>(std::string_view raw);
-template std::string DecompressMulti<32>(std::string_view compressed);
+INSTANTIATE_SCALAR(1);
+INSTANTIATE_SCALAR(2);
+INSTANTIATE_SCALAR(4);
+INSTANTIATE_SCALAR(8);
+INSTANTIATE_SCALAR(16);
+INSTANTIATE_SCALAR(32);
 
-template std::string CompressMulti<16>(std::string_view raw);
-template std::string DecompressMulti<16>(std::string_view compressed);
+INSTANTIATE_AVX(8);
+INSTANTIATE_AVX(16);
+INSTANTIATE_AVX(24);
+INSTANTIATE_AVX(32);
+INSTANTIATE_AVX(40);
+INSTANTIATE_AVX(48);
 
-template std::string DecompressMultiAvx512<8>(std::string_view compressed);
-template std::string DecompressMultiAvx512<16>(std::string_view compressed);
-template std::string DecompressMultiAvx512<32>(std::string_view compressed);
-template std::string CompressMultiAvx512<8>(std::string_view compressed);
-template std::string CompressMultiAvx512<16>(std::string_view compressed);
-template std::string CompressMultiAvx512<32>(std::string_view compressed);
 }  // namespace huffman
