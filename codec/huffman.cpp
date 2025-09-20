@@ -1035,15 +1035,23 @@ void DecodeSingleStream(const UsedDecoder& decoder,
 }
 
 template <int Scale>
-vec8x64 SimulateGather(vec8x64 index, const void* base) {
-    alignas(64) uint64_t ind_buf[8];  
-    alignas(64) char gather_buf[64];  
-    _mm512_store_epi64(ind_buf, index);
-    UNROLL8 for (int k = 0; k < 8; ++k) {
-      memcpy(gather_buf + 8 * k, reinterpret_cast<const char*>(base) + 
-          ind_buf[k] * Scale, 8);
-      }
-    return _mm512_load_epi64(gather_buf);
+vec8x64 SimulateGather64(vec8x64 index, const void* base) {
+  alignas(64) uint64_t ind_buf[8];
+  alignas(64) char gather_buf[64];
+  _mm512_store_epi64(ind_buf, index);
+  UNROLL8 for (int k = 0; k < 8; ++k) {
+    memcpy(gather_buf + 8 * k,
+           reinterpret_cast<const char*>(base) + ind_buf[k] * Scale, 8);
+  }
+  return _mm512_load_epi64(gather_buf);
+}
+
+template <typename IntT>
+IntT ReadLE(const void* p) {
+  static_assert(std::is_integral_v<IntT>);
+  IntT x;
+  memcpy(&x, p, sizeof(IntT));
+  return x;
 }
 
 // An AVX-512 ZMM* register holds 512 bits, which here is split into 8 64-bit
@@ -1056,7 +1064,7 @@ vec8x64 SimulateGather(vec8x64 index, const void* base) {
 //
 // The following macros are used to create and use arrays of SIMD variables.
 
-// Defines an array of variables, one for every
+// Defines an array of variables matching the number of streams.
 #define DEF_ARR(type, name, val)                             \
   type name[M];                                              \
   do {                                                       \
@@ -1181,41 +1189,46 @@ std::string CompressMultiAvx512Permute(std::string_view raw) {
   DEF_VECS(buf_v, _mm512_setzero_si512());
   DEF_VECS(buf_len_v, _mm512_setzero_si512());
 
+#ifndef FAKE_GATHER
   DEF_VECS(read_v, _mm512_loadu_epi64(read_index + 8 * m));
+#else
+  const char* read_ptr[K];
+  for (int k = 0; k < K; ++k) read_ptr[k] = read_base + read_index[k];
+#endif
+
   DEF_VECS(write_v, _mm512_loadu_epi64(write_index + 8 * m));
 
   // Last stripe is always one of the smallest, so we can just base our loop
   // condition on that.
   for (size_t read_i = 0; read_i + 7 < sizes[K - 1]; read_i += 8) {
+    // Low and high bytes of the codes are combined using
+    // _mm512_unpacklo_epi8 and _mm512_unpackhi_epi8 below. For these
+    // instructions to work we must move the bytes corresponding to first and
+    // second 4 symbols to lower and upper words of each 128-bit lane.
+    //
+    // By shuffling the input bytes we don't need to perform multiple
+    // shuffles later.
     const vec64x8 lohi_ctrl =
-        _mm512_set4_epi32(0x0f0e'0d0c,0x0706'0504, 0x0b0a'0908,0x0302'0100);
-#if 0
+        _mm512_set4_epi32(0x0f0e'0d0c, 0x0706'0504, 0x0b0a'0908, 0x0302'0100);
+#ifdef FAKE_GATHER
     // TODO: Optimize and compare "fake" gather.
     vec64x8 bytes[M];
-    alignas(64) char gather_buf[64];  
     FORM(m) {
+      alignas(64) uint64_t gather_buf[8];
       UNROLL8 for (int k = 0; k < 8; ++k) {
-        memcpy(gather_buf + 8 * k, read_base + read_index[m * 8 + k], 8);
+        gather_buf[k] = ReadLE<uint64_t>(read_ptr[m * 8 + k]);
       }
-      UNROLL8 for (int k = 0; k < 8; ++k) {
-        read_index[m * 8 + k] += 8;
-      }
+      UNROLL8 for (int k = 0; k < 8; ++k) { read_ptr[m * 8 + k] += 8; }
       bytes[m] = _mm512_load_epi64(gather_buf);
-    }
-#endif
-    DEF_VECS(bytes, _mm512_i64gather_epi64(read_v[m], read_base, 1));
-    // DEF_VECS(bytes, SimulateGather<1>(read_v[m], read_base));
-    FORM(m) {
-      read_v[m] = _mm512_add_epi64(read_v[m], _mm512_set1_epi64(8));
-      // Low and high bytes of the codes are combined using
-      // _mm512_unpacklo_epi8 and _mm512_unpackhi_epi8 below. For these
-      // instructions to work we must move the bytes corresponding to first and
-      // second 4 symbols to lower and upper words of each 128-bit lane.
-      //
-      // By shuffling the input bytes we don't need to perform multiple
-      // shuffles later.
       bytes[m] = _mm512_shuffle_epi8(bytes[m], lohi_ctrl);
     }
+#else
+    DEF_VECS(bytes, _mm512_i64gather_epi64(read_v[m], read_base, 1));
+    FORM(m) {
+      read_v[m] = _mm512_add_epi64(read_v[m], _mm512_set1_epi64(8));
+      bytes[m] = _mm512_shuffle_epi8(bytes[m], lohi_ctrl);
+    }
+#endif
 
     // Look up codes for all 64 bytes simultaneously.
     // Each vpermb/_mm512_permutexvar_epi8 does a lookup of 64 elements.
@@ -1238,10 +1251,10 @@ std::string CompressMultiAvx512Permute(std::string_view raw) {
     // processing 4 symbols for each stream at a time.
     // UNROLL8 doesn't help here.
     for (int j = 0; j < 2; ++j) {
-      DEF_VECS(pack4,  j == 0 ? _mm512_unpacklo_epi8(code_lo[m], code_hi[m])
-                                : _mm512_unpackhi_epi8(code_lo[m], code_hi[m]));
+      DEF_VECS(pack4, j == 0 ? _mm512_unpacklo_epi8(code_lo[m], code_hi[m])
+                             : _mm512_unpackhi_epi8(code_lo[m], code_hi[m]));
       // Length was stored in low bits of `code_lo`
-      DEF_VECS(len4,  _mm512_and_si512(pack4[m], _mm512_set1_epi16(0xf)));
+      DEF_VECS(len4, _mm512_and_si512(pack4[m], _mm512_set1_epi16(0xf)));
       // (Using "andnot" instead of "and" saves one register.)
       DEF_VECS(code4, _mm512_andnot_si512(_mm512_set1_epi16(0xf), pack4[m]));
       FORM(m) {
@@ -1273,9 +1286,14 @@ std::string CompressMultiAvx512Permute(std::string_view raw) {
     // Store vector registers back to C arrays.
     _mm512_storeu_epi64(buf_arr + 8 * m, buf_v[m]);
     _mm512_storeu_epi64(buf_len_arr + 8 * m, buf_len_v[m]);
+#ifndef FAKE_GATHER
     _mm512_storeu_epi64(read_index + 8 * m, read_v[m]);
+#endif
     _mm512_storeu_epi64(write_index + 8 * m, write_v[m]);
   }
+#ifdef FAKE_GATHER
+  for (int k = 0; k < K; ++k) read_index[k] = read_ptr[k] - read_base;
+#endif
 
   // Write remaining bytes one stream at a time.
   for (int k = 0; k < K; ++k) {
@@ -2038,9 +2056,9 @@ std::string DecompressMultiAvx512(std::string_view compressed) {
 #define INSTANTIATE_AVX(K)                                                    \
   template std::string CompressMultiAvx512<K>(std::string_view raw);          \
   template std::string DecompressMultiAvx512<K>(std::string_view compressed); \
-  template std::string CompressMultiAvx512Permute<K>(                       \
+  template std::string CompressMultiAvx512Permute<K>(                         \
       std::string_view compressed);                                           \
-  template std::string DecompressMultiAvx512Permute<K>(                     \
+  template std::string DecompressMultiAvx512Permute<K>(                       \
       std::string_view compressed);                                           \
   template std::string DecompressMultiAvx512Gather<K>(                        \
       std::string_view compressed);                                           \

@@ -79,7 +79,7 @@ two-symbols at a time decoding.
 
 The performance is quite close to the 
 
-## AVX-512 gather
+## AVX-512 Gather
 
 These implementations of compression and decompression are relatively
 straight-forward vectorizations of the "scalar" method.
@@ -100,7 +100,7 @@ Multiples of 8 data streams are supported, leading to higher IPC.
 
 Using 32 streams with AVX-512 gather method gives the best decompression speed.
 
-## AVX-512 register
+## AVX-512 Permute
 
 CPUs supporting AVX-512 have 32 512-bit registers (ZMM0 to ZMM31).
 In the AVX-512 "register" method, I use these registers
@@ -110,11 +110,18 @@ A key of this approach is the the VPERMB instruction included in
 , which is supported today by AMD Zen4, AMD Zen5, and some more modern Intel
 CPUs such as Cannon Lake, Ice Lake, and Sapphire Rapids.
 This instruction can perform an arbitrary byte permutation,
-meaning it can also be used to treat 512-bit registers
-as 64-value lookup tables for 8-bit values.
-Lookups to similar 256-element tables can be performed using
-four permutes masked with comparison results.
+meaning 512-bit registers can be treated as 64-value lookup tables for bytes.
+Lookups to a 256-element table can be performed using four registers
+and permute instructions masked with comparison results.
 
+This approach gives the best compression speed, since compression is
+essentially just a single lookup for each symbol from a 256-element array.
+Four permutes and three comparisons are used to perform lookups for 64 symbols.
+XXX: Not including symbol counting this is XX % faster than scalar code and
+Huff0.
+
+Using this approach in decompression, fully avoiding the gather instructions,
+requires a more complex approach.
 
 Decompression speed using this method is not as fast,
 since the regular decoding tables cannot be fit in registers
@@ -141,4 +148,16 @@ instructions.
 
 ## 
 
-For compression, 
+# Conclusions: what did we learn and is this at all useful?
+
+Using AVX-512, we find compression to be XX % faster and decompression
+to be XXYY% faster.
+I find this a bit underwhelming,
+given that each instruction is processing 8 times the amount of data compared
+to the scalar algorithm.
+
+Main reason for 
+
+The speed results are slightly underwhelming. Given that we are processing 8 
+times the amount of data with every instruction, one would hope
+to achieve better than XX % 

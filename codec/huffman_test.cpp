@@ -45,12 +45,12 @@ class NameGenerator {
 };
 
 using Compressors = ::testing::Types<
-    huffman::HuffmanCompressor,
-    huffman::HuffmanCompressorMulti<1>,
-    huffman::HuffmanCompressorMulti<4>,
-    huffman::HuffmanCompressorMulti<8>, huffman::HuffmanCompressorMulti<32>,
-    huffman::HuffmanCompressorAvx<8>, huffman::HuffmanCompressorAvx<32>,
-    AvxCheckCompressor<8>, huffman::Huff0Compressor>;
+    huffman::HuffmanCompressor, huffman::HuffmanCompressorMulti<1>,
+    huffman::HuffmanCompressorMulti<4>, huffman::HuffmanCompressorMulti<8>,
+    huffman::HuffmanCompressorMulti<32>, huffman::HuffmanCompressorAvx<8>,
+    huffman::HuffmanCompressorAvx<32>, huffman::HuffmanCompressorAvxGather<32>,
+    huffman::HuffmanCompressorAvxPermute<32>, AvxCheckCompressor<8>,
+    huffman::Huff0Compressor>;
 TYPED_TEST_SUITE(CompressorTest, Compressors, NameGenerator);
 
 TYPED_TEST(CompressorTest, Hello) {
@@ -104,8 +104,7 @@ TYPED_TEST(CompressorTest, EqualCounts) {
   // This tests some edge cases in the code, which caused a bug previously.
   string raw;
   for (int i = 0; i < 4; ++i)
-    for (int c = 0; c < 256; ++c)
-      raw.push_back(c);
+    for (int c = 0; c < 256; ++c) raw.push_back(c);
   std::shuffle(raw.begin(), raw.end(), std::mt19937());
 
   string compressed = TypeParam::Compress(raw);
@@ -122,7 +121,7 @@ TYPED_TEST(CompressorTest, LongRandom) {
     do {
       // Make a biased distribution
       ch = (rand() & rand() & rand()) & 0xff;
-    // } while (!std::isprint(ch));
+      // } while (!std::isprint(ch));
     } while (false);
     raw.push_back(ch);
   }

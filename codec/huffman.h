@@ -1,7 +1,7 @@
 #pragma once
 
-#include <string>
 #include <format>
+#include <string>
 #include <string_view>
 
 namespace huffman {
@@ -19,7 +19,7 @@ std::string CompressMultiAvx512(std::string_view raw);
 template <int K>
 std::string DecompressMultiAvx512(std::string_view compressed);
 
-// Specific implementations, 
+// Specific implementations,
 template <int K>
 std::string CompressMultiAvx512Gather(std::string_view raw);
 template <int K>
@@ -37,12 +37,10 @@ class HuffmanCompressor {
   static std::string Decompress(std::string_view compressed) {
     return ::huffman::Decompress(compressed);
   }
-  static std::string name() {
-    return "Huffman";
-  }
+  static std::string name() { return "Huffman"; }
 };
 
-template<int K> 
+template <int K>
 class HuffmanCompressorMulti {
  public:
   static std::string Compress(std::string_view raw) {
@@ -51,9 +49,7 @@ class HuffmanCompressorMulti {
   static std::string Decompress(std::string_view compressed) {
     return DecompressMulti<K>(compressed);
   }
-  static std::string name() {
-    return std::format("HuffmanMulti<{}>", K);
-  }
+  static std::string name() { return std::format("HuffmanMulti<{}>", K); }
 };
 
 template <int K>
@@ -68,9 +64,37 @@ class HuffmanCompressorAvx {
     return DecompressMultiAvx512<K>(compressed);
   }
 
-  static std::string name() {
-    return std::format("HuffmanAvx<{}>", K);
+  static std::string name() { return std::format("HuffmanAvx<{}>", K); }
+};
+
+template <int K>
+class HuffmanCompressorAvxGather {
+ public:
+  static_assert(K % 8 == 0,
+                "K must be a multiple of 8 in HuffmanCompressorAvxGather<K>");
+  static std::string Compress(std::string_view raw) {
+    return CompressMultiAvx512Gather<K>(raw);
   }
+  static std::string Decompress(std::string_view compressed) {
+    return DecompressMultiAvx512Gather<K>(compressed);
+  }
+
+  static std::string name() { return std::format("HuffmanAvxGather<{}>", K); }
+};
+
+template <int K>
+class HuffmanCompressorAvxPermute {
+ public:
+  static_assert(K % 8 == 0,
+                "K must be a multiple of 8 in HuffmanCompressorAvxPermute<K>");
+  static std::string Compress(std::string_view raw) {
+    return CompressMultiAvx512Permute<K>(raw);
+  }
+  static std::string Decompress(std::string_view compressed) {
+    return DecompressMultiAvx512Permute<K>(compressed);
+  }
+
+  static std::string name() { return std::format("HuffmanAvxPermute<{}>", K); }
 };
 
 }  // namespace huffman
