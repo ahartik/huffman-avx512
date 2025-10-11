@@ -1234,17 +1234,15 @@ std::string CompressMultiAvx512Permute(std::string_view raw) {
     // Each vpermb/_mm512_permutexvar_epi8 does a lookup of 64 elements.
     // The operation repeated 4 times and masked using comparisons to cover all
     // 256 possible byte values.
-    DEF_VECS(code_hi, _mm512_permutexvar_epi8(bytes[m], hi_v[0]));
-    DEF_VECS(code_lo, _mm512_permutexvar_epi8(bytes[m], lo_v[0]));
+    DEF_VECS(code_hi, _mm512_permutex2var_epi8(hi_v[0], bytes[m],  hi_v[1]));
+    DEF_VECS(code_lo, _mm512_permutex2var_epi8(lo_v[0], bytes[m],  lo_v[1]));
     FORM(m) {
-      UNROLL8 for (int k = 1; k < 4; ++k) {
-        mask64 cmp =
-            _mm512_cmpge_epu8_mask(bytes[m], _mm512_set1_epi8(char(k * 64)));
-        code_hi[m] =
-            _mm512_mask_permutexvar_epi8(code_hi[m], cmp, bytes[m], hi_v[k]);
-        code_lo[m] =
-            _mm512_mask_permutexvar_epi8(code_lo[m], cmp, bytes[m], lo_v[k]);
-      }
+      mask64 cmp =
+          _mm512_cmpge_epu8_mask(bytes[m], _mm512_set1_epi8(char(128)));
+      vec64x8 hi2 = _mm512_permutex2var_epi8(hi_v[2],bytes[m], hi_v[3]);
+      vec64x8 lo2 = _mm512_permutex2var_epi8(lo_v[2],bytes[m], lo_v[3]);
+      code_hi[m] = _mm512_mask_blend_epi8(cmp, code_hi[m], hi2);
+      code_lo[m] = _mm512_mask_blend_epi8(cmp, code_lo[m], lo2);
     }
 
     // Now, we must rearrange and pack these codes. We'll do this by
@@ -1764,13 +1762,13 @@ std::string DecompressMultiAvx512Permute(std::string_view compressed) {
   //    be found by subtraction.
   //  4. Once 8 such indices have been decoded for each stream (total 64
   //     indices = 64 bytes), look up the symbols ("raw" bytes) using
-  //     `_mm512_permutexvar_epi8`
+  //     `_mm512_permutex2var_epi8`
 
   // Prepare data for lookups: build vectors for looking up code length by
   // comparisons.
   uint16_t first_code_for_len[17] = {};
   uint16_t code_len_offset[17] = {};
-  int last_len = -1;
+  int last_len = 0;
   {
     int sym_i = 0;
     ForallCodes(header.len_count, header.syms, header.num_syms,
@@ -2004,14 +2002,13 @@ std::string DecompressMultiAvx512Permute(std::string_view compressed) {
     }
     // Symbol indices have been decoded, now they need to be converted to
     // symbols. This is done by repeated masked vpermb instructions.
-    DEF_VECS(syms, _mm512_permutexvar_epi8(sym_i[m], sym_lookup_v[0]));
-    for (int j = 1; j < 4; ++j) {
-      FORM(m) {
-        mask64 ge =
-            _mm512_cmpge_epu8_mask(sym_i[m], _mm512_set1_epi8(char(64 * j)));
-        syms[m] = _mm512_mask_permutexvar_epi8(syms[m], ge, sym_i[m],
-                                               sym_lookup_v[j]);
-      }
+    DEF_VECS(syms, _mm512_permutex2var_epi8(sym_lookup_v[0], sym_i[m], sym_lookup_v[1]));
+    FORM(m) {
+      mask64 ge =
+          _mm512_cmpge_epu8_mask(sym_i[m], _mm512_set1_epi8(char(128)));
+      vec64x8 syms2 = _mm512_permutex2var_epi8(sym_lookup_v[2],
+          sym_i[m], sym_lookup_v[3]);
+      syms[m] = _mm512_mask_blend_epi8(ge, syms[m], syms2);
     }
 
     FORM(m) {

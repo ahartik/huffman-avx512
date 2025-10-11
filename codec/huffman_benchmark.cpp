@@ -15,7 +15,7 @@
 
 #include "benchmark/benchmark.h"
 
-constexpr size_t LEN = 127 << 10;
+constexpr size_t LEN = 100 << 10;
 
 namespace {
 
