@@ -58,6 +58,9 @@ print(decompress)
 def bps_str(x):
     return "{} MiB/s".format(int(x / (2**20)))
 
+# AVX-512 Gather | 16 | 1943 MiB/s | 3419 MiB/s
+print("Method | Streams | Compress | Decompress");
+print("-------|--- | ---| ---");
 for key in compress:
     tname,streams = key.split('/')
     print("{} | {} | {} | {}".format(

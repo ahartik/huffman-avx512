@@ -582,7 +582,7 @@ class CodeReader {
 };
 
 struct DecodedSym {
-  // NOTE: This order is assumed by some AVX code.
+  // NOTE: This order (code_len first) is assumed by AVX code below.
   uint8_t code_len = 0;
   uint8_t sym = 0;
 };
