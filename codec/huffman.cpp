@@ -573,6 +573,10 @@ class CodeReader {
 
   bool is_fast() const { return input_ >= begin_; }
 
+  const char* cur_end() const { return input_ + 8; }
+  const char* cur_begin() const { return begin_; }
+  int bit_offset() { return bits_used_; }
+
  private:
   const char* input_;
   const char* begin_;
@@ -701,58 +705,6 @@ class Decoder2x {
 
 }  // namespace
 
-std::string Compress(std::string_view raw) {
-  auto hist = MakeHistogram(raw);
-  CanonicalCoding coding = MakeCanonicalCoding(hist);
-
-  uint64_t output_bits = 0;
-  for (int i = 0; i < coding.num_syms; ++i) {
-    uint8_t sym = coding.sorted_syms[i];
-    output_bits += coding.codes[sym].len * hist[sym];
-  }
-
-  std::string compressed;
-  // TODO: Fail for too long strings.
-  write_u32(compressed, raw.size());
-  if (raw.size() == 0) {
-    // SPECIAL CASE FOR EMPTY STRING:
-  }
-  write_u32(compressed, coding.len_mask);
-  for (uint16_t count : coding.len_count) {
-    if (count != 0) {
-      compressed.push_back(uint8_t(count));
-    }
-  }
-  compressed.append(reinterpret_cast<char*>(coding.sorted_syms),
-                    coding.num_syms);
-  const int header_size = compressed.size();
-  // TODO: Get rid of slop bytes
-  const int kSlop = 8;
-  compressed.resize(header_size + (output_bits + 7) / 8 + kSlop);
-
-  CodeWriter writer(&compressed[header_size],
-                    compressed.data() + compressed.size());
-  const uint8_t* input = reinterpret_cast<const uint8_t*>(raw.data());
-  const uint8_t* end = input + raw.size();
-
-  // This pragma showed a 2% speedup once.
-  // UNROLL8
-  // #pragma GCC unroll 4
-  while (input + 3 < end) {
-    // We can write multiple codes for each flush.
-    UNROLL8 for (int j = 0; j < 4; ++j) {
-      BitCode a = coding.codes[*input++];
-      writer.WriteFast(a);
-    }
-    writer.Flush();
-  }
-  while (input != end) {
-    writer.WriteCode(coding.codes[*input++]);
-  }
-  writer.Finish();
-  return compressed;
-}
-
 struct ParsedHeader {
   uint32_t raw_size;
   uint16_t len_count[kMaxCodeLength + 1];
@@ -782,48 +734,6 @@ ParsedHeader ParseCompressedHeader(std::string_view& compressed) {
   compressed.remove_prefix(header.num_syms);
   return header;
 }
-
-template <typename UsedDecoder>
-std::string DecompressImpl(std::string_view compressed) {
-  const auto header = ParseCompressedHeader(compressed);
-  UsedDecoder decoder(header.len_count, header.syms, header.num_syms);
-
-  std::string raw(header.raw_size, 0);
-  CodeReader reader(compressed.data(), compressed.data() + compressed.size());
-
-  uint8_t* output = reinterpret_cast<uint8_t*>(raw.data());
-  uint8_t* output_end = output + raw.size();
-  // Four symbols at a time
-  bool readers_good = true;
-
-  const int output_slop = 4 * decoder.max_symbols_decoded() - 1;
-
-  while (readers_good & (output + output_slop < output_end)) {
-    UNROLL8 for (int j = 0; j < 4; ++j) {
-      int num_bits = decoder.Decode(reader.code(), &output);
-      reader.ConsumeFast(num_bits);
-    }
-    readers_good = reader.FillBufferFast();
-  }
-
-  // Last symbols
-  while (output != output_end) {
-    reader.FillBuffer();
-    int bits_read = decoder.Decode1(reader.code(), &output);
-    reader.ConsumeBits(bits_read);
-  }
-  return raw;
-}
-
-std::string Decompress(std::string_view compressed) {
-  return DecompressImpl<Decoder2x>(compressed);
-}
-
-template <int T>
-class CompressBase {
- public:
- private:
-};
 
 template <int K>
 std::string CompressMulti(std::string_view raw) {
@@ -935,6 +845,51 @@ std::string CompressMulti(std::string_view raw) {
   return compressed;
 }
 
+template <typename UsedDecoder>
+void
+// __attribute__ ((noinline)) 
+  DecodeSingleStreamWithReader(CodeReader& reader,
+                                  const UsedDecoder& decoder,
+                                  uint8_t* out_begin, uint8_t* out_end) {
+  uint8_t* output = out_begin;
+
+  // For some reason this slowing 
+#if 1
+  bool reader_good = reader.FillBufferFast();
+  const int output_slop = 4 * decoder.max_symbols_decoded() - 1;
+  while ((output + output_slop < out_end) & reader_good) {
+    UNROLL8 for (int j = 0; j < 4; ++j) {
+      int bits = decoder.Decode(reader.code(), &output);
+      reader.ConsumeFast(bits);
+    }
+    reader_good = reader.FillBufferFast();
+  }
+#endif
+
+  reader.FillBuffer();
+
+  while (output <= out_end - decoder.max_symbols_decoded()) {
+    int bits = decoder.Decode(reader.code(), &output);
+    reader.ConsumeBits(bits);
+  }
+
+  while (output < out_end) {
+    int bits = decoder.Decode1(reader.code(), &output);
+    reader.ConsumeBits(bits);
+  }
+}
+
+template <typename UsedDecoder>
+void DecodeSingleStream(const UsedDecoder& decoder,
+                        const uint8_t* compressed_begin,
+                        const uint8_t* compressed_end, int bit_offset,
+                        uint8_t* out_begin, uint8_t* out_end) {
+  CodeReader reader(reinterpret_cast<const char*>(compressed_begin),
+                    reinterpret_cast<const char*>(compressed_end));
+  reader.ConsumeBits(bit_offset);
+  DecodeSingleStreamWithReader(reader, decoder, out_begin, out_end);
+}
+
 template <int K, typename UsedDecoder>
 std::string DecompressMultiImpl(std::string_view compressed) {
   const auto header = ParseCompressedHeader(compressed);
@@ -952,11 +907,14 @@ std::string DecompressMultiImpl(std::string_view compressed) {
   }
   CodeReader reader[K];
   for (int k = 0; k < K; ++k) {
-    // int start_index = (k == 0) ? 0 : end_offset[k - 1];
-    // reader[k].Init(compressed.data() + start_index,
-    //                compressed.data() + end_offset[k]);
+#if 0
+    int start_index = (k == 0) ? 0 : end_offset[k - 1];
+    reader[k].Init(compressed.data() + start_index,
+                   compressed.data() + end_offset[k]);
+#else
     // This works just as well and seems slightly faster:
     reader[k].Init(compressed.data(), compressed.data() + end_offset[k]);
+#endif
   }
 
   std::string raw(header.raw_size, 0);
@@ -979,10 +937,15 @@ std::string DecompressMultiImpl(std::string_view compressed) {
       // for k == 0. This is certain for good inputs, but bad inputs
       // could be crafted where this is not the case. This optimization would
       // improve decompression speed by ~1%.
+#if 0
+      can_continue &= reader[k].FillBufferFast(k > 0);
+#else
       can_continue &= reader[k].FillBufferFast();
+#endif
       // assert(reader[k].is_fast());
       can_continue &= part_output[k] + output_slop < part_end[k];
     }
+    // can_continue &= part_output[K-1] + output_slop < part_end[K-1];
     if (!can_continue) {
       break;
     }
@@ -995,14 +958,8 @@ std::string DecompressMultiImpl(std::string_view compressed) {
   }
   // Read last symbols.
   for (int k = 0; k < K; ++k) {
-    reader[k].FillBuffer();
-    while (part_output[k] != part_end[k]) {
-      const uint64_t code = reader[k].code();
-      int bits_read = decoder.Decode1(code, &part_output[k]);
-      reader[k].ConsumeBits(bits_read);
-      DLOG(1) << "Last sym " << k << " : " << SymToStr(*(part_output[k] - 1))
-              << "\n";
-    }
+    DecodeSingleStreamWithReader(reader[k], decoder, part_output[k],
+                                 part_end[k]);
   }
   return raw;
 }
@@ -1014,25 +971,6 @@ std::string DecompressMulti(std::string_view compressed) {
 
 // Slowish method for decoding a single stream. Used to finish off decoding one
 // character at a time.
-
-template <typename UsedDecoder>
-void DecodeSingleStream(const UsedDecoder& decoder,
-                        const uint8_t* compressed_begin,
-                        const uint8_t* compressed_end, int bit_offset,
-                        uint8_t* out_begin, uint8_t* out_end) {
-  CodeReader reader(reinterpret_cast<const char*>(compressed_begin),
-                    reinterpret_cast<const char*>(compressed_end));
-  reader.ConsumeBits(bit_offset);
-  uint8_t* output = out_begin;
-  while (output <= out_end - decoder.max_symbols_decoded()) {
-    int bits = decoder.Decode(reader.code(), &output);
-    reader.ConsumeBits(bits);
-  }
-  while (output < out_end) {
-    int bits = decoder.Decode1(reader.code(), &output);
-    reader.ConsumeBits(bits);
-  }
-}
 
 template <int Scale>
 vec8x64 SimulateGather64(vec8x64 index, const void* base) {
@@ -1234,13 +1172,13 @@ std::string CompressMultiAvx512Permute(std::string_view raw) {
     // Each vpermb/_mm512_permutexvar_epi8 does a lookup of 64 elements.
     // The operation repeated 4 times and masked using comparisons to cover all
     // 256 possible byte values.
-    DEF_VECS(code_hi, _mm512_permutex2var_epi8(hi_v[0], bytes[m],  hi_v[1]));
-    DEF_VECS(code_lo, _mm512_permutex2var_epi8(lo_v[0], bytes[m],  lo_v[1]));
+    DEF_VECS(code_hi, _mm512_permutex2var_epi8(hi_v[0], bytes[m], hi_v[1]));
+    DEF_VECS(code_lo, _mm512_permutex2var_epi8(lo_v[0], bytes[m], lo_v[1]));
     FORM(m) {
       mask64 cmp =
           _mm512_cmpge_epu8_mask(bytes[m], _mm512_set1_epi8(char(128)));
-      vec64x8 hi2 = _mm512_permutex2var_epi8(hi_v[2],bytes[m], hi_v[3]);
-      vec64x8 lo2 = _mm512_permutex2var_epi8(lo_v[2],bytes[m], lo_v[3]);
+      vec64x8 hi2 = _mm512_permutex2var_epi8(hi_v[2], bytes[m], hi_v[3]);
+      vec64x8 lo2 = _mm512_permutex2var_epi8(lo_v[2], bytes[m], lo_v[3]);
       code_hi[m] = _mm512_mask_blend_epi8(cmp, code_hi[m], hi2);
       code_lo[m] = _mm512_mask_blend_epi8(cmp, code_lo[m], lo2);
     }
@@ -2002,12 +1940,12 @@ std::string DecompressMultiAvx512Permute(std::string_view compressed) {
     }
     // Symbol indices have been decoded, now they need to be converted to
     // symbols. This is done by repeated masked vpermb instructions.
-    DEF_VECS(syms, _mm512_permutex2var_epi8(sym_lookup_v[0], sym_i[m], sym_lookup_v[1]));
+    DEF_VECS(syms, _mm512_permutex2var_epi8(sym_lookup_v[0], sym_i[m],
+                                            sym_lookup_v[1]));
     FORM(m) {
-      mask64 ge =
-          _mm512_cmpge_epu8_mask(sym_i[m], _mm512_set1_epi8(char(128)));
-      vec64x8 syms2 = _mm512_permutex2var_epi8(sym_lookup_v[2],
-          sym_i[m], sym_lookup_v[3]);
+      mask64 ge = _mm512_cmpge_epu8_mask(sym_i[m], _mm512_set1_epi8(char(128)));
+      vec64x8 syms2 =
+          _mm512_permutex2var_epi8(sym_lookup_v[2], sym_i[m], sym_lookup_v[3]);
       syms[m] = _mm512_mask_blend_epi8(ge, syms[m], syms2);
     }
 

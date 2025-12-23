@@ -4,6 +4,7 @@
 #include <random>
 
 #include <iostream>
+#include <algorithm>
 #include <fstream>
 #include <cstdint>
 #include <cstdlib>
@@ -59,20 +60,50 @@ std::string_view FileData() {
 
 template <typename Compressor>
 void BM_CompressBiased(benchmark::State& state) {
-#if 0
-  srand(0);
-  std::string raw;
-  for (int i = 0; i < LEN; ++i) {
-    raw.push_back(uint8_t(rand() & rand() & rand()));
-  }
-#endif
   std::string raw = GenerateProbaData(0.2);
-
   for (auto _ : state) {
     std::string compressed = Compressor::Compress(raw);
   }
   state.SetBytesProcessed(state.iterations() * raw.size());
 }
+
+template <typename Compressor>
+void BM_DecompressBiased(benchmark::State& state) {
+  std::string raw = GenerateProbaData(0.2);
+
+  std::string compressed = Compressor::Compress(raw);
+  for (auto _ : state) {
+    std::string decompressed = Compressor::Decompress(compressed);
+  }
+  state.SetBytesProcessed(state.iterations() * raw.size());
+  double ratio = double(compressed.size()) / raw.size();
+  state.counters["ratio"] = ratio;
+}
+
+template <typename Compressor>
+void BM_CompressSorted(benchmark::State& state) {
+  std::string raw = GenerateProbaData(0.2);
+  std::sort(raw.begin(), raw.end());
+  for (auto _ : state) {
+    std::string compressed = Compressor::Compress(raw);
+  }
+  state.SetBytesProcessed(state.iterations() * raw.size());
+}
+
+template <typename Compressor>
+void BM_DecompressSorted(benchmark::State& state) {
+  std::string raw = GenerateProbaData(0.2);
+  std::sort(raw.begin(), raw.end());
+
+  std::string compressed = Compressor::Compress(raw);
+  for (auto _ : state) {
+    std::string decompressed = Compressor::Decompress(compressed);
+  }
+  state.SetBytesProcessed(state.iterations() * raw.size());
+  double ratio = double(compressed.size()) / raw.size();
+  state.counters["ratio"] = ratio;
+}
+
 
 template <typename Compressor>
 void BM_CompressUniform(benchmark::State& state) {
@@ -88,27 +119,6 @@ void BM_CompressUniform(benchmark::State& state) {
     std::string compressed = Compressor::Compress(raw);
   }
   state.SetBytesProcessed(state.iterations() * raw.size());
-}
-
-template <typename Compressor>
-void BM_DecompressBiased(benchmark::State& state) {
-#if 0
-  srand(0);
-  std::string raw;
-  for (int i = 0; i < LEN; ++i) {
-    raw.push_back(uint8_t(rand() & rand() & rand()));
-  }
-#else
-  std::string raw = GenerateProbaData(0.2);
-#endif
-
-  std::string compressed = Compressor::Compress(raw);
-  for (auto _ : state) {
-    std::string decompressed = Compressor::Decompress(compressed);
-  }
-  state.SetBytesProcessed(state.iterations() * raw.size());
-  double ratio = double(compressed.size()) / raw.size();
-  state.counters["ratio"] = ratio;
 }
 
 template <typename Compressor>
@@ -241,17 +251,18 @@ void BM_DecompressFile(benchmark::State& state) {
 
 #define DEFINE_BENCHMARKS(TYPE)          \
   BENCHMARK(BM_CompressBiased<TYPE>);    \
+  BENCHMARK(BM_CompressSorted<TYPE>);    \
   BENCHMARK(BM_CompressUniform<TYPE>);   \
   BENCHMARK(BM_CompressShort<TYPE>);     \
   BENCHMARK(BM_CompressLorem<TYPE>);     \
   BENCHMARK(BM_DecompressBiased<TYPE>);  \
+  BENCHMARK(BM_DecompressSorted<TYPE>);  \
   BENCHMARK(BM_DecompressUniform<TYPE>); \
   BENCHMARK(BM_DecompressShort<TYPE>);   \
   BENCHMARK(BM_DecompressLorem<TYPE>);   \
   BENCHMARK(BM_CompressFile<TYPE>);   \
   BENCHMARK(BM_DecompressFile<TYPE>);   \
 
-DEFINE_BENCHMARKS(::huffman::HuffmanCompressor)
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<1>)
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<4>)
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<8>)

@@ -6,9 +6,6 @@
 
 namespace huffman {
 
-std::string Compress(std::string_view raw);
-std::string Decompress(std::string_view compressed);
-
 template <int K>
 std::string CompressMulti(std::string_view raw);
 template <int K>
@@ -29,6 +26,7 @@ std::string DecompressMultiAvx512Gather(std::string_view compressed);
 template <int K>
 std::string DecompressMultiAvx512Permute(std::string_view compressed);
 
+#if 0
 class HuffmanCompressor {
  public:
   static std::string Compress(std::string_view raw) {
@@ -39,6 +37,7 @@ class HuffmanCompressor {
   }
   static std::string name() { return "Huffman"; }
 };
+#endif
 
 template <int K>
 class HuffmanCompressorMulti {
