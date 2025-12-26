@@ -932,20 +932,10 @@ std::string DecompressMultiImpl(std::string_view compressed) {
   while (true) {
     bool can_continue = true;
     UNROLL8 for (int k = 0; k < K; ++k) {
-      // The checks inside this call could be made faster for k > 0
-      // if we were certain that decoding of k > 0 did not go further bcak than
-      // for k == 0. This is certain for good inputs, but bad inputs
-      // could be crafted where this is not the case. This optimization would
-      // improve decompression speed by ~1%.
-#if 0
-      can_continue &= reader[k].FillBufferFast(k > 0);
-#else
-      can_continue &= reader[k].FillBufferFast();
-#endif
-      // assert(reader[k].is_fast());
-      can_continue &= part_output[k] + output_slop < part_end[k];
+      if (!reader[k].FillBufferFast() || part_output[k] + output_slop >= part_end[k]) {
+        can_continue = false;
+      }
     }
-    // can_continue &= part_output[K-1] + output_slop < part_end[K-1];
     if (!can_continue) {
       break;
     }
