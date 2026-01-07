@@ -48,7 +48,7 @@ cc_binary(
   srcs = ["histogram_benchmark.cpp"],
   deps = [
     ":histogram",
-    "@google_benchmark//:benchmark"
+    "@google_benchmark//:benchmark_main"
   ],
 )
 

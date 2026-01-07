@@ -7,21 +7,21 @@ popular formats such as .zip, .gz, .jpg, .png and more.
 Zstandard is a very popular compression algorithm as of 2025,
 because it offers a good combination of speed and and compression
 efficiency.
-One of the tools Zstandard uses to achieve good performance
-is the used Huff0 Huffman coding.
+A key component of Zstandard is its
+Huffman coding implementation, called Huff0.
 Huff0 is fast because it takes advantage of the fact that modern CPUs can
-execute more than one instruction for every cycle.
+execute more than one instruction every cycle.
 By splitting the data to four (4) streams, decompression
-can perform many more instructions per cycle (IPC).
+achieves higher number of instructions per cycle (IPC).
 CPUs capable of executing more than one instruction per cycle
 are called "superscalar".
+One of the first superscalar processors was the first Intel Pentium (P5).
 
-Modern x86 CPUs, in addition to being able to perform multiple
-instructions per cycle, have instructions that work on not just singular (i.e. scalar) values,
+Modern x86 CPUs, in addition to being able to perform multiple instructions per
+cycle, have instructions that work on not just singular (i.e. scalar) values,
 but on vectors of up to 512 bits in AVX-512.
-The goal of this repository is to explore whether AVX-512 vector
+The goal of this project was to explore whether AVX-512 vector
 instructions in particular can be used to speed up Huffman coding.
-
 
 I wanted to explore whether AVX-512 instructions could make Huffman compression
 or decompression faster.
@@ -31,38 +31,95 @@ which is also used in the very popular
 [Zstandard](https://github.com/facebook/zstd) compression algorithm.
 (The code I used is not the assembly-optimized version found in modern
  Zstandard, but an earlier plain C version.)
-One of the things I learned here is that Huff0 (and likely Zstandard) are fast
-because the data format is built around making a fast decoder.
+The data format of Huff0 is expertly designed such that the encoder is
+as fast as possible.
 I embraced the same spirit here, looking for a data format which is fast
 when using AVX-512.
-
 
 
 # Results
 The code was developed and tested using an AMD Ryzen 9950X CPU.
 
-| Method             | Streams  | Compress MiB/s | Decompress MiB/s | IPC  |
-|--------------      | -------- | -------------- | ---------------- | ---- |
-| Huff0              |  4       |                |                  |
-| scalar             |  1       |                |                  |
-| scalar             |  4       |                |                  |
-| AVX-512 gather     |  8       |                |                  |
-| AVX-512 gather     |  32      |                |                  |
-| AVX-512 register   |  8       |                |                  |
-| AVX-512 register   |  32      |                |
+## Biased input
+
+Probability of symbol $i \in \{0, \ldots, 255\}$ is $p_i = 0.8^i \cdot 0.2$.
+
+Method | Streams | Compress | Decompress
+-------|--- | ---| ---
+Scalar | 1 | **1947 MiB/s** | **1056 MiB/s**
+Scalar | 4 | **1834 MiB/s** | **3616 MiB/s**
+Scalar | 8 | 1952 MiB/s | **3218 MiB/s**
+AVX-512 Gather | 8 | 1610 MiB/s | 1842 MiB/s
+AVX-512 Permute | 8 | **2637 MiB/s** | 1162 MiB/s
+AVX-512 Gather | 16 | 1904 MiB/s | **3355 MiB/s** 
+AVX-512 Permute | 16 | **2988 MiB/s** | 2123 MiB/s
+AVX-512 Gather | 32 | 1858 MiB/s | **5026 MiB/s**
+AVX-512 Permute | 32 | **2926 MiB/s** | 3198 MiB/s
+AVX-512 Gather | 48 | 1674 MiB/s | **4950 MiB/s**
+AVX-512 Permute | 48 | **2673 MiB/s** | 3453 MiB/s
+Huff0 | 4 | 1946 MiB/s | 3636 MiB/s
+
+Using the fastest AVX-512 methods results with 32 streams results
+in 50% faster compression and 38% faster decompression
+compared to Huff0.
+
+## English Wikipedia: 
+
+First 100 KiB of [enwik8](https://mattmahoney.net/dc/textdata.html).
+
+Method | Streams | Compress | Decompress
+-------|--- | ---| ---
+Scalar | 1 | 1890 MiB/s | 972 MiB/s
+Scalar | 4 | 1782 MiB/s | 2953 MiB/s
+Scalar | 8 | 1879 MiB/s | 2625 MiB/s
+AVX-512 Gather | 8 | 1559 MiB/s | 1596 MiB/s
+AVX-512 Permute | 8 | 2498 MiB/s | 1155 MiB/s
+AVX-512 Gather | 16 | 1837 MiB/s | 2803 MiB/s
+AVX-512 Permute | 16 | 2854 MiB/s | 2109 MiB/s
+AVX-512 Gather | 32 | 1822 MiB/s | 4039 MiB/s
+AVX-512 Permute | 32 | 2803 MiB/s | 3177 MiB/s
+AVX-512 Gather | 48 | 1651 MiB/s | 3994 MiB/s
+AVX-512 Permute | 48 | 2641 MiB/s | 3441 MiB/s
+Huff0 | 4 | 1956 MiB/s | 2974 MiB/s
+
+Using the fastest AVX-512 methods results with 32 streams results
+in 43% faster compression and 36% faster decompression
+compared to Huff0.
+
+# Methods and analysis
+
+Besides Huff0, the data format is equivalent between scalar and AVX code
+for the same number of streams.
+
+## Scalar
+
+These methods were my implementations of Huffman coding split to multiple
+streams while sticking to regular scalar code.
+Initially these werent very fast, so I studied Huff0 code and copied many ideas
+and tricks.
+Unlike Huff0, my code supports a template-parameterized number of streams,
+which allows comparison between different stream count.
 
 
-Here "Single" is my implementation of regular Huffman coding, where 
-My scalar code is slightly less well optimized than Huff0, resulting 
+## AVX Gather
 
-The bottleneck of the AVX-512 decompression is the `vpgatherqq` instruction
-(`_mm512_i64_gather_epi64` intrinsic), which loads 8 64-bit integers from
-memory using 64-bit offsets.
-This instruction is implemented as "microcoded"
-on AMD Zen 5, and according to [Agner's instruction
-tables](https://www.agner.org/optimize/instruction_tables.pdf), it results in
+These methods are straightforward vectorizations of the scalar method, with
+reads and writes replaced by gather and scatter instructions respectively.
+
+On AMD Zen 5, gather and scatter instructions are implemented as "microcoded".
+According to [Agner's instruction
+tables](https://www.agner.org/optimize/instruction_tables.pdf),
+the used gather instruction (`vpgatherqq`/`_mm512_i64_gather_epi64`) 
+results in
 40 [micro-ops (μops)](https://en.wikipedia.org/wiki/Micro-operation).
-This explains the extremely low 
+
+
+##  AVX Permute
+
+These methods use AVX-512 registers instead of lookup tables for encoding and
+decoding.
+An array of 256 bytes can be stored in four registers, allowing 64 lookups
+to be performed using two `vpermi2b`/ byte permute instructions.
 
 ## Breakdown of compression
 

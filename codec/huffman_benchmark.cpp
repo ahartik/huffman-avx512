@@ -267,26 +267,16 @@ DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<1>)
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<4>)
 DEFINE_BENCHMARKS(::huffman::HuffmanCompressorMulti<8>)
 
-DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvx<8>)
-DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvx<16>)
-DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvx<24>)
-DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvx<32>)
-DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvx<40>)
-DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvx<48>)
+#define DEFINE_AVX_BENCHMARKS(K) \
+   DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvx<K>) \
+   DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvxGather<K>) \
+   DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvxPermute<K>)
 
-DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvxGather<8>)
-DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvxGather<16>)
-DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvxGather<24>)
-DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvxGather<32>)
-DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvxGather<40>)
-DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvxGather<48>)
+DEFINE_AVX_BENCHMARKS(8)
+DEFINE_AVX_BENCHMARKS(16)
+DEFINE_AVX_BENCHMARKS(32)
+DEFINE_AVX_BENCHMARKS(48)
 
-DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvxPermute<8>)
-DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvxPermute<16>)
-DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvxPermute<24>)
-DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvxPermute<32>)
-DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvxPermute<40>)
-DEFINE_BENCHMARKS(::huffman::HuffmanCompressorAvxPermute<48>)
 
 DEFINE_BENCHMARKS(::huffman::Huff0Compressor)
 

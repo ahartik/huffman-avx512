@@ -847,13 +847,12 @@ std::string CompressMulti(std::string_view raw) {
 
 template <typename UsedDecoder>
 void
-// __attribute__ ((noinline)) 
-  DecodeSingleStreamWithReader(CodeReader& reader,
-                                  const UsedDecoder& decoder,
-                                  uint8_t* out_begin, uint8_t* out_end) {
+// __attribute__ ((noinline))
+DecodeSingleStreamWithReader(CodeReader& reader, const UsedDecoder& decoder,
+                             uint8_t* out_begin, uint8_t* out_end) {
   uint8_t* output = out_begin;
 
-  // For some reason this slowing 
+  // For some reason this slowing
 #if 1
   bool reader_good = reader.FillBufferFast();
   const int output_slop = 4 * decoder.max_symbols_decoded() - 1;
@@ -932,7 +931,8 @@ std::string DecompressMultiImpl(std::string_view compressed) {
   while (true) {
     bool can_continue = true;
     UNROLL8 for (int k = 0; k < K; ++k) {
-      if (!reader[k].FillBufferFast() || part_output[k] + output_slop >= part_end[k]) {
+      if (!reader[k].FillBufferFast() ||
+          part_output[k] + output_slop >= part_end[k]) {
         can_continue = false;
       }
     }
