@@ -1,4 +1,7 @@
-# Huffman coding using AVX-512 
+# Huffman coding using AVX-512
+
+# Introduction
+
 [Huffman coding](https://en.wikipedia.org/wiki/Huffman_coding) is 
 a popular method to represent a stream of symbols using a
 variable number of bits for each symbol based on symbol frequency.
@@ -56,7 +59,7 @@ AVX-512 Gather | 48 | 1674 MiB/s | **4950 MiB/s**
 AVX-512 Permute | 48 | **2673 MiB/s** | 3453 MiB/s
 Huff0 | 4 | 1946 MiB/s | 3636 MiB/s
 
-Using the fastest AVX-512 methods results with 32 streams results
+Using the fastest AVX-512 methods with 32 streams results
 in 50% faster compression and 38% faster decompression
 compared to Huff0.
 
@@ -79,7 +82,7 @@ AVX-512 Gather | 48 | 1651 MiB/s | **3994 MiB/s**
 AVX-512 Permute | 48 | **2641 MiB/s** | 3441 MiB/s
 Huff0 | 4 | 1956 MiB/s | 2974 MiB/s
 
-Using the fastest AVX-512 methods results with 32 streams results
+Using the fastest AVX-512 methods with 32 streams results
 in 43% faster compression and 36% faster decompression
 compared to Huff0.
 
@@ -123,7 +126,6 @@ I find this a bit underwhelming,
 given that each instruction is processing 8 times the amount of data compared
 to the scalar algorithm.
 
-
 I believe the bottleneck is slow gather and scatter instructions.
 On AMD Zen 5, gather and scatter instructions are implemented as "microcoded".
 According to [Agner's instruction
@@ -142,4 +144,7 @@ In particular, the code makes no serious effort to be safe
 against malformed "compressed" data.
 I believe with effort it is possible to safeguard against
 such data with minimal performance cost.
+
+I believe the code to be somewhat readable, so if you're interested
+in the details of these methods you should check the code.
 
